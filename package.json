@@ -2,6 +2,7 @@
   "name": "ai-flow-studio-demo",
   "private": true,
   "version": "0.1.0",
+  "packageManager": "pnpm@11.17.0",
   "type": "module",
   "scripts": {
     "dev": "concurrently -k -n WEB,API -c cyan,green \"vite\" \"node --watch server.mjs\"",
