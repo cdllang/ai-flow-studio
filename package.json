@@ -1,0 +1,34 @@
+{
+  "name": "ai-flow-studio-demo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n WEB,API -c cyan,green \"vite\" \"node --watch server.mjs\"",
+    "build": "tsc --noEmit && vite build",
+    "start": "node server.mjs",
+    "verify:config": "node scripts/verify-config.mjs",
+    "verify:features": "node scripts/verify-features.mjs",
+    "verify:interactions": "node scripts/verify-interactions.mjs",
+    "verify:ratios": "node scripts/verify-ratios.mjs",
+    "verify:preview": "node scripts/verify-image-preview.mjs"
+  },
+  "dependencies": {
+    "@xyflow/react": "^12.9.2",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7",
+    "playwright-core": "1.55.0"
+  }
+}

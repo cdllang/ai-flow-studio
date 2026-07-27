@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+user-config.json
+user-config.json.tmp
+data/
+*.tar
+*.tar.gz
+*.log
+/*.png

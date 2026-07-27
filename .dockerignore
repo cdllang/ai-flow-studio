@@ -1,0 +1,14 @@
+node_modules
+dist
+data
+.git
+.gitignore
+.env
+.env.local
+.env.*.local
+user-config.json
+user-config.json.tmp
+*.log
+*.png
+scripts
+.obsidian-docs-stage
