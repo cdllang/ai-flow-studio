@@ -1,4 +1,9 @@
 import { chromium } from 'playwright-core';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const screenshotDir = path.resolve('.verification');
+fs.mkdirSync(screenshotDir, { recursive: true });
 
 const browser = await chromium.launch({ headless: true, executablePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe' });
 const consoleProblems = [];
@@ -75,7 +80,7 @@ try {
   await branchPage.getByText('TRUE_PATH').waitFor({ timeout: 8000 });
 } catch (error) {
   console.log('BRANCH_DEBUG\n' + await branchPage.locator('body').innerText());
-  await branchPage.screenshot({ path: 'interaction-branch-error.png', fullPage: true });
+  await branchPage.screenshot({ path: path.join(screenshotDir, 'interaction-branch-error.png'), fullPage: true });
   throw error;
 }
 const trueBranchExecuted = await branchPage.getByText('TRUE_PATH').isVisible();
@@ -83,7 +88,7 @@ await branchPage.getByRole('button', { name: '运行过程' }).click();
 const falseBranchSkipped = await branchPage.getByText('条件分支未命中，已跳过').count() > 0;
 await branchPage.getByRole('button', { name: '运行记录' }).click();
 const runRecordCreated = await branchPage.getByText('运行成功').count() > 0;
-await branchPage.screenshot({ path: 'interaction-complete.png', fullPage: true });
+await branchPage.screenshot({ path: path.join(screenshotDir, 'interaction-complete.png'), fullPage: true });
 
 const stopContext = await browser.newContext({ viewport: { width: 1200, height: 800 } });
 await stopContext.addInitScript(() => {

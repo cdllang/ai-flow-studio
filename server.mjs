@@ -4,7 +4,7 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-dotenv.config({ path: '.env.local', override: true });
+dotenv.config({ path: '.env.local', override: false });
 
 const app = express();
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -95,9 +95,13 @@ app.post('/api/images', async (req, res) => {
   if (!imageApiKey) {
     return res.status(503).json({ code: 'IMAGE_KEY_MISSING', message: '图像模型 Key 未配置', requestId: id });
   }
-  const { prompt, size = '1024x1024', quality = 'high', referenceImage = null } = req.body ?? {};
+  const { prompt, size = '1024x1024', quality = 'high', count = 1, referenceImage = null } = req.body ?? {};
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ code: 'PROMPT_REQUIRED', message: '请输入图像提示词', requestId: id });
+  }
+  const imageCount = Number(count);
+  if (!Number.isInteger(imageCount) || imageCount < 1 || imageCount > 4) {
+    return res.status(400).json({ code: 'INVALID_IMAGE_COUNT', message: '单个图像节点每次可生成 1–4 张图片', requestId: id });
   }
   if (referenceImage !== null && (typeof referenceImage !== 'object' || typeof referenceImage.dataUrl !== 'string')) {
     return res.status(400).json({ code: 'INVALID_REFERENCE_IMAGE', message: '参考图片格式无效', requestId: id });
@@ -132,7 +136,7 @@ app.post('/api/images', async (req, res) => {
         form.append('prompt', prompt);
         form.append('size', size);
         form.append('quality', quality);
-        form.append('n', '1');
+        form.append('n', String(imageCount));
         form.append('image', imageInput.blob, imageInput.filename);
         response = await fetch(`${baseUrl}/images/edits`, {
           method: 'POST',
@@ -146,7 +150,7 @@ app.post('/api/images', async (req, res) => {
             Authorization: `Bearer ${imageApiKey}`,
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({ model: imageModel, prompt, size, quality, n: 1 })
+          body: JSON.stringify({ model: imageModel, prompt, size, quality, n: imageCount })
         });
       }
       data = await response.json().catch(() => ({}));
@@ -159,10 +163,15 @@ app.post('/api/images', async (req, res) => {
     if (!response.ok) {
       const upstreamMessage = data?.error?.message || `图像服务返回 ${response.status}`;
       if (String(process.env.IMAGE_DEMO_FALLBACK).toLowerCase() === 'true') {
-        return res.json({
+        const images = Array.from({ length: imageCount }, (_, index) => ({
+          id: `${id}-${index + 1}`,
           url: '/assets/case-template-1.jpg',
           base64: null,
-          revisedPrompt: null,
+          revisedPrompt: null
+        }));
+        return res.json({
+          ...images[0],
+          images,
           model: imageModel,
           mode: imageInput ? 'edit' : 'generate',
           simulated: true,
@@ -177,11 +186,19 @@ app.post('/api/images', async (req, res) => {
         requestId: id
       });
     }
-    const first = data?.data?.[0] ?? {};
+    const images = (Array.isArray(data?.data) ? data.data : []).map((item, index) => ({
+      id: `${id}-${index + 1}`,
+      url: item?.url ?? null,
+      base64: item?.b64_json ?? null,
+      revisedPrompt: item?.revised_prompt ?? null
+    })).filter((item) => item.url || item.base64);
+    const first = images[0] ?? {};
     return res.json({
       url: first.url ?? null,
-      base64: first.b64_json ?? null,
-      revisedPrompt: first.revised_prompt ?? null,
+      base64: first.base64 ?? null,
+      revisedPrompt: first.revisedPrompt ?? null,
+      images,
+      count: images.length,
       model: imageModel,
       mode: imageInput ? 'edit' : 'generate',
       simulated: false,
@@ -249,7 +266,7 @@ app.post('/api/http', async (req, res) => {
   }
 });
 
-const dist = path.join(root, 'dist');
+const dist = path.resolve(root, process.env.STATIC_DIR || 'dist');
 app.use(express.static(dist));
 app.use((_req, res, next) => {
   if (process.env.NODE_ENV !== 'production') return next();

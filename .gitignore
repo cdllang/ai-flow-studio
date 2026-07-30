@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.tmp-build/
+.verification/
 .env
 .env.local
 .env.*.local

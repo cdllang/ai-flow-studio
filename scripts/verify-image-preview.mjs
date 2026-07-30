@@ -1,4 +1,9 @@
 import { chromium } from 'playwright-core';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const screenshotDir = path.resolve('.verification');
+fs.mkdirSync(screenshotDir, { recursive: true });
 
 const browser = await chromium.launch({
   headless: true,
@@ -57,9 +62,9 @@ async function verifyRatio({ name, ratioLabel, width, height, screenshot }) {
   await page.locator('.flow-node').filter({ hasText: '\u751f\u6210\u4e3b\u89c6\u89c9' }).click();
   await page.getByRole('button', { name: new RegExp(`^${ratioLabel}`) }).click();
   await page.getByRole('button', { name: '\u8bd5\u8fd0\u884c' }).click();
-  await page.getByText('\u56fe\u50cf\u8f93\u51fa').waitFor();
+  await page.locator('.output-image-card').waitFor();
 
-  const trigger = page.locator('.image-result-trigger');
+  const trigger = page.locator('.output-image-trigger').first();
   await trigger.locator('img').evaluate((image) => {
     if (image.complete && image.naturalWidth) return;
     return new Promise((resolve, reject) => {
@@ -68,7 +73,7 @@ async function verifyRatio({ name, ratioLabel, width, height, screenshot }) {
     });
   });
   await page.waitForFunction(({ expectedWidth, expectedHeight }) => {
-    const image = document.querySelector('.image-result-trigger img');
+    const image = document.querySelector('.output-image-trigger img');
     return image instanceof HTMLImageElement && image.naturalWidth === expectedWidth && image.naturalHeight === expectedHeight;
   }, { expectedWidth: width, expectedHeight: height });
 
@@ -79,10 +84,10 @@ async function verifyRatio({ name, ratioLabel, width, height, screenshot }) {
   const adaptive = Math.abs(frameRatio - expectedRatio) < 0.035;
 
   await trigger.click();
-  const dialog = page.getByRole('dialog', { name: '\u56fe\u7247\u9884\u89c8' });
+  const dialog = page.getByRole('dialog', { name: '\u591a\u56fe\u7247\u7ed3\u679c\u9884\u89c8' });
   await dialog.waitFor();
-  const previewOpened = await page.getByAltText('\u751f\u6210\u7ed3\u679c\u5927\u56fe\u9884\u89c8').isVisible();
-  if (screenshot) await page.screenshot({ path: screenshot, fullPage: true });
+  const previewOpened = await dialog.locator('img').isVisible();
+  if (screenshot) await page.screenshot({ path: path.join(screenshotDir, screenshot), fullPage: true });
 
   await page.keyboard.press('Escape');
   const escapeClosed = await dialog.isHidden();

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Background,
   Controls,
@@ -23,14 +23,19 @@ import {
   Check,
   ChevronDown,
   CircleStop,
+  ClipboardCopy,
   Code2,
+  Combine,
   Copy,
   Download,
   FileJson,
+  FileDown,
+  FileUp,
   FileText,
   GitBranch,
   Image as ImageIcon,
   KeyRound,
+  LayoutTemplate,
   LoaderCircle,
   Menu,
   MessageSquareText,
@@ -53,8 +58,23 @@ import {
   ZoomIn,
   Square
 } from 'lucide-react';
+import { OutputPanel } from './components/OutputPanel';
+import {
+  applyOutputBindings,
+  createWorkflowExport,
+  evaluateCondition,
+  mergeOutputGroups,
+  normalizeRuntimeOutputGroup,
+  parseWorkflowExport,
+  topologicalLayers,
+  validateWorkflowGraph,
+  type RuntimeOutputLike,
+  type OutputBinding,
+  type WorkflowOutputBundle
+} from './workflow/core';
+import { ecommerceWorkflowPresets, instantiatePreset, type WorkflowPreset } from './workflow/presets';
 
-type NodeKind = 'start' | 'llm' | 'image' | 'condition' | 'http' | 'code' | 'output';
+type NodeKind = 'start' | 'llm' | 'image' | 'condition' | 'http' | 'code' | 'aggregate' | 'output';
 type NodeStatus = 'idle' | 'waiting' | 'running' | 'success' | 'error' | 'skipped' | 'cancelled';
 type FlowData = Record<string, unknown> & {
   kind: NodeKind;
@@ -73,6 +93,10 @@ type FlowData = Record<string, unknown> & {
   code?: string;
   imageSize?: string;
   imageQuality?: 'high' | 'medium';
+  imageCount?: number;
+  aggregateStrategy?: 'object' | 'array' | 'text';
+  outputKey?: string;
+  bindings?: OutputBinding[];
 };
 
 type ApiStatus = {
@@ -100,8 +124,7 @@ type RunLog = {
 
 type WorkflowSnapshot = { nodes: Node<FlowData>[]; edges: Edge[] };
 
-type RuntimeOutput = WorkflowResult & {
-  value?: unknown;
+type RuntimeOutput = RuntimeOutputLike & {
   branch?: boolean;
   status?: number;
 };
@@ -112,7 +135,7 @@ type RunRecord = {
   status: 'success' | 'error' | 'cancelled';
   duration: string;
   logs: RunLog[];
-  result: WorkflowResult;
+  result: WorkflowOutputBundle;
 };
 
 type VersionRecord = {
@@ -129,20 +152,38 @@ type ReferenceImage = {
   dataUrl: string;
 };
 
-type OutputFile = {
-  name: string;
-  url: string;
-  mimeType?: string;
-};
+const emptyOutputBundle = (): WorkflowOutputBundle => ({ schemaVersion: 1, groups: [] });
 
-type WorkflowResult = {
-  text?: string;
-  image?: string;
-  imageAspectRatio?: string;
-  files?: OutputFile[];
-  error?: string;
-  notice?: string;
-};
+function outputBundleForStorage(bundle: WorkflowOutputBundle): WorkflowOutputBundle {
+  let stripped = false;
+  const groups = bundle.groups.map((group) => ({
+    ...group,
+    items: group.items.filter((item) => {
+      const isInlineAsset = (item.type === 'image' || item.type === 'file') && item.asset.url.startsWith('data:');
+      if (isInlineAsset) stripped = true;
+      return !isInlineAsset;
+    })
+  }));
+  return {
+    ...bundle,
+    groups,
+    ...(stripped ? { notice: '内联图片仅保留在本次页面会话中，未写入本地运行记录。' } : {})
+  };
+}
+
+function coerceOutputBundle(value: unknown): WorkflowOutputBundle {
+  if (value && typeof value === 'object' && Array.isArray((value as WorkflowOutputBundle).groups)) return value as WorkflowOutputBundle;
+  if (!value || typeof value !== 'object') return emptyOutputBundle();
+  const legacy = value as { text?: string; image?: string; imageAspectRatio?: string; files?: Array<{ url: string; name?: string; mimeType?: string }>; error?: string; notice?: string };
+  const group = normalizeRuntimeOutputGroup('legacy-output', '历史输出', [{
+    sourceNodeId: 'legacy',
+    sourceTitle: '旧版运行记录',
+    text: legacy.text,
+    image: legacy.image ? { url: legacy.image, name: '历史图片', aspectRatio: legacy.imageAspectRatio } : undefined,
+    files: legacy.files
+  }]);
+  return { ...mergeOutputGroups(group), error: legacy.error, notice: legacy.notice };
+}
 
 const nodeMeta: Record<NodeKind, { label: string; icon: typeof Bot; color: string; group: string }> = {
   start: { label: '开始', icon: Play, color: '#f6f4ee', group: '输入输出' },
@@ -151,6 +192,7 @@ const nodeMeta: Record<NodeKind, { label: string; icon: typeof Bot; color: strin
   condition: { label: '条件分支', icon: GitBranch, color: '#f0b458', group: '逻辑' },
   http: { label: 'HTTP 请求', icon: Webhook, color: '#38d676', group: '工具' },
   code: { label: '代码', icon: Code2, color: '#a78bfa', group: '工具' },
+  aggregate: { label: '变量聚合', icon: Combine, color: '#4ecdc4', group: '工具' },
   output: { label: '结束', icon: CircleStop, color: '#f6f4ee', group: '输入输出' }
 };
 
@@ -192,8 +234,9 @@ const initialNodes: Node<FlowData>[] = [
       title: '生成主视觉',
       subtitle: 'gpt-image-2 · 1024×1024',
       model: 'gpt-image-2',
-      imageSize: '1024x1024',
-      imageQuality: 'high',
+        imageSize: '1024x1024',
+        imageQuality: 'high',
+        imageCount: 1,
       status: 'idle'
     }
   },
@@ -215,7 +258,7 @@ function loadSavedWorkflow() {
   try {
     const raw = localStorage.getItem('aiflow.demo.workflow');
     if (!raw) return null;
-    const saved = JSON.parse(raw) as { nodes?: Node<FlowData>[]; edges?: Edge[]; input?: string };
+    const saved = JSON.parse(raw) as { nodes?: Node<FlowData>[]; edges?: Edge[]; input?: string; title?: string };
     if (!Array.isArray(saved.nodes) || !Array.isArray(saved.edges)) return null;
     return saved;
   } catch {
@@ -309,14 +352,6 @@ function runCodeInWorker(code: string, input: unknown, context: Record<string, u
   });
 }
 
-function outputImageStyle(aspectRatio = '1 / 1'): CSSProperties {
-  const [width, height] = aspectRatio.split('/').map((value) => Number(value.trim()));
-  const ratio = width > 0 && height > 0 ? width / height : 1;
-  if (ratio < 1) return { width: `${Math.round(190 * ratio)}px`, height: '190px', aspectRatio };
-  const displayWidth = Math.min(260, Math.round(190 * ratio));
-  return { width: `${displayWidth}px`, height: `${Math.round(displayWidth / ratio)}px`, aspectRatio };
-}
-
 function aspectRatioLabel(aspectRatio?: string) {
   if (!aspectRatio) return '自动比例';
   const [rawWidth, rawHeight] = aspectRatio.split('/').map((value) => Math.round(Number(value.trim())));
@@ -372,22 +407,22 @@ function App() {
   const [configPanelOpen, setConfigPanelOpen] = useState(true);
   const [workspaceView, setWorkspaceView] = useState<'editor' | 'runs' | 'versions'>('editor');
   const [undoStack, setUndoStack] = useState<WorkflowSnapshot[]>([]);
-  const [runRecords, setRunRecords] = useState<RunRecord[]>(() => loadStoredList<RunRecord>('aiflow.demo.runs'));
+  const [runRecords, setRunRecords] = useState<RunRecord[]>(() => loadStoredList<RunRecord>('aiflow.demo.runs').map((record) => ({ ...record, result: coerceOutputBundle(record.result) })));
   const [versions, setVersions] = useState<VersionRecord[]>(() => loadStoredList<VersionRecord>('aiflow.demo.versions'));
   const [toast, setToast] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [nodeSearch, setNodeSearch] = useState('');
+  const [workflowTitle, setWorkflowTitle] = useState(savedWorkflow?.title ?? '社媒主视觉生成器');
+  const [presetOpen, setPresetOpen] = useState(false);
   const [input, setInput] = useState(savedWorkflow?.input ?? '为一家专注 AI 效率工具的中文品牌设计一张社交媒体主视觉，克制、专业、有技术感。');
   const [running, setRunning] = useState(false);
   const [runLogs, setRunLogs] = useState<RunLog[]>([
     { id: 'hint', title: '等待运行', detail: '填写测试输入，然后点击右上角“试运行”', status: 'muted' }
   ]);
-  const [result, setResult] = useState<WorkflowResult>({});
+  const [result, setResult] = useState<WorkflowOutputBundle>(emptyOutputBundle);
   const [referenceImage, setReferenceImage] = useState<ReferenceImage | null>(null);
   const [imageInputError, setImageInputError] = useState('');
   const [draggingImage, setDraggingImage] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const [imagePreviewOpen, setImagePreviewOpen] = useState(false);
   const [apiKeys, setApiKeys] = useState<StoredApiKeys>(loadStoredApiKeys);
   const [config, setConfig] = useState<ApiStatus | null>(null);
   const [chatApiKey, setChatApiKey] = useState('');
@@ -399,6 +434,7 @@ function App() {
   const [activeDebug, setActiveDebug] = useState<'process' | 'output' | 'logs'>('process');
   const abortControllerRef = useRef<AbortController | null>(null);
   const stopRequestedRef = useRef(false);
+  const importWorkflowRef = useRef<HTMLInputElement | null>(null);
   const selectedNode = nodes.find((node) => node.id === selectedId);
 
   useEffect(() => {
@@ -422,25 +458,16 @@ function App() {
   useEffect(() => {
     const timer = window.setTimeout(() => {
       const cleanNodes = nodes.map((node) => ({ ...node, data: { ...node.data, status: 'idle' } }));
-      localStorage.setItem('aiflow.demo.workflow', JSON.stringify({ nodes: cleanNodes, edges, input, savedAt: new Date().toISOString() }));
+      localStorage.setItem('aiflow.demo.workflow', JSON.stringify({ nodes: cleanNodes, edges, input, title: workflowTitle, savedAt: new Date().toISOString() }));
     }, 800);
     return () => window.clearTimeout(timer);
-  }, [nodes, edges, input]);
+  }, [nodes, edges, input, workflowTitle]);
 
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(''), 2200);
     return () => window.clearTimeout(timer);
   }, [toast]);
-
-  useEffect(() => {
-    if (!imagePreviewOpen) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setImagePreviewOpen(false);
-    };
-    window.addEventListener('keydown', closeOnEscape);
-    return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [imagePreviewOpen]);
 
   const rememberSnapshot = useCallback(() => {
     const snapshot = cleanSnapshot(nodes, edges);
@@ -569,17 +596,6 @@ function App() {
     reader.readAsDataURL(file);
   };
 
-  const copyOutputText = async () => {
-    if (!result.text) return;
-    try {
-      await navigator.clipboard.writeText(result.text);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
-    } catch {
-      setResult((previous) => ({ ...previous, error: '复制失败，请手动选择文字复制' }));
-    }
-  };
-
   const downloadBlob = (blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
@@ -589,22 +605,71 @@ function App() {
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
-  const downloadOutputText = () => {
-    if (result.text) downloadBlob(new Blob([result.text], { type: 'text/plain;charset=utf-8' }), 'workflow-output.txt');
+  const workflowJson = () => createWorkflowExport({
+    title: workflowTitle,
+    input,
+    nodes: cleanSnapshot(nodes, edges).nodes,
+    edges: cleanSnapshot(nodes, edges).edges
+  });
+
+  const copyWorkflow = async () => {
+    try {
+      await navigator.clipboard.writeText(workflowJson());
+      setToast('工作流 JSON 已复制');
+    } catch {
+      setToast('复制失败，请检查浏览器剪贴板权限');
+    }
   };
 
-  const downloadOutputAsset = async (url: string, filename: string) => {
-    try {
-      const response = await fetch(url);
-      if (!response.ok) throw new Error('download failed');
-      downloadBlob(await response.blob(), filename);
-    } catch {
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = filename;
-      anchor.target = '_blank';
-      anchor.click();
-    }
+  const exportWorkflow = () => {
+    const safeName = workflowTitle.replace(/[\\/:*?"<>|]/g, '-').trim() || 'workflow';
+    downloadBlob(new Blob([workflowJson()], { type: 'application/json;charset=utf-8' }), `${safeName}.aiflow.json`);
+    setToast('工作流已导出');
+  };
+
+  const importWorkflow = (file?: File) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        if (typeof reader.result !== 'string') throw new Error('无法读取工作流文件');
+        const document = parseWorkflowExport(reader.result);
+        const validation = validateWorkflowGraph(document.workflow);
+        if (!validation.valid) throw new Error(validation.issues[0]?.message || '工作流结构无效');
+        const importedNodes = document.workflow.nodes as unknown as Node<FlowData>[];
+        if (importedNodes.some((node) => !node.data?.kind || !(node.data.kind in nodeMeta))) throw new Error('工作流包含当前版本不支持的节点');
+        rememberSnapshot();
+        setNodes(importedNodes.map((node) => ({ ...node, data: { ...node.data, status: 'idle' } })));
+        setEdges(document.workflow.edges as Edge[]);
+        setWorkflowTitle(typeof document.workflow.title === 'string' ? document.workflow.title : file.name.replace(/\.aiflow\.json$|\.json$/i, ''));
+        setInput(typeof document.workflow.input === 'string' ? document.workflow.input : '');
+        setResult(emptyOutputBundle());
+        setSelectedId(importedNodes.find((node) => node.data.kind !== 'start')?.id || importedNodes[0]?.id || '');
+        setWorkspaceView('editor');
+        setToast(`已导入 ${importedNodes.length} 个节点`);
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : '工作流导入失败');
+      }
+    };
+    reader.onerror = () => setToast('工作流文件读取失败');
+    reader.readAsText(file);
+  };
+
+  const applyPreset = (preset: WorkflowPreset) => {
+    if (nodes.length && !window.confirm(`使用“${preset.name}”将替换当前画布，是否继续？替换后仍可点击撤销恢复结构。`)) return;
+    rememberSnapshot();
+    const instance = instantiatePreset(preset);
+    setNodes(instance.nodes as unknown as Node<FlowData>[]);
+    setEdges(instance.edges as Edge[]);
+    setWorkflowTitle(instance.name);
+    setInput(instance.sampleInput);
+    setSelectedId(instance.nodes.find((node) => node.data.kind !== 'start')?.id || instance.nodes[0]?.id || '');
+    setResult(emptyOutputBundle());
+    setRunLogs([{ id: 'hint', title: '模板已就绪', detail: `已载入 ${instance.nodes.length} 个节点，可直接试运行`, status: 'muted' }]);
+    setPresetOpen(false);
+    setWorkspaceView('editor');
+    setConfigPanelOpen(true);
+    setToast(`已应用电商预设：${instance.name}`);
   };
 
   const addNode = (kind: NodeKind) => {
@@ -618,12 +683,14 @@ function App() {
       data: {
         kind,
         title: `${nodeMeta[kind].label} ${count}`,
-        subtitle: kind === 'condition' ? '判断上游文本' : kind === 'http' ? 'GET · 未配置 URL' : kind === 'code' ? 'JavaScript · Worker' : '点击配置节点',
+        subtitle: kind === 'condition' ? '判断上游文本' : kind === 'http' ? 'GET · 未配置 URL' : kind === 'code' ? 'JavaScript · Worker' : kind === 'aggregate' ? '按来源聚合 · object' : '点击配置节点',
         status: 'idle',
         ...(kind === 'condition' ? { conditionSource: 'upstream', conditionOperator: 'contains', conditionValue: '' } : {}),
         ...(kind === 'http' ? { httpMethod: 'GET', httpUrl: '', httpHeaders: '{}', httpBody: '' } : {}),
         ...(kind === 'code' ? { code: 'return { text: String(input ?? "") };' } : {}),
-        ...(kind === 'image' ? { model: 'gpt-image-2', imageSize: '1024x1024', imageQuality: 'high' } : {})
+        ...(kind === 'aggregate' ? { aggregateStrategy: 'object' } : {}),
+        ...(kind === 'output' ? { outputKey: `output_${count}` } : {}),
+        ...(kind === 'image' ? { model: 'gpt-image-2', imageSize: '1024x1024', imageQuality: 'high', imageCount: 1 } : {})
       }
     };
     setNodes((items) => [...items, node]);
@@ -642,10 +709,11 @@ function App() {
   };
 
   const publishWorkflow = () => {
-    const starts = nodes.filter((node) => node.data.kind === 'start');
-    const outputs = nodes.filter((node) => node.data.kind === 'output');
-    if (starts.length !== 1 || outputs.length < 1) {
-      setToast('发布失败：需要且只能有一个开始节点，并至少包含一个结束节点');
+    const validation = validateWorkflowGraph({ nodes, edges });
+    if (!validation.valid) {
+      setToast(`发布失败：${validation.issues[0]?.message || '工作流结构无效'}`);
+      const target = validation.issues.find((issue) => issue.nodeId)?.nodeId;
+      if (target) { setSelectedId(target); setConfigPanelOpen(true); setWorkspaceView('editor'); }
       return;
     }
     const snapshot = cleanSnapshot(nodes, edges);
@@ -677,31 +745,38 @@ function App() {
 
   const runWorkflow = async () => {
     if (running || !input.trim()) return;
-    if (!config?.chatConfigured || !config?.imageConfigured) {
-      setConfigMessage({ kind: 'error', text: '请先填写基础模型和图像模型 API Key' });
+    const validation = validateWorkflowGraph({ nodes, edges });
+    if (!validation.valid) {
+      setToast(`运行失败：${validation.issues[0]?.message || '工作流结构无效'}`);
+      const target = validation.issues.find((issue) => issue.nodeId)?.nodeId;
+      if (target) { setSelectedId(target); setConfigPanelOpen(true); }
+      return;
+    }
+    const reachableSet = new Set(validation.reachableNodeIds);
+    const requiresChat = nodes.some((node) => reachableSet.has(node.id) && node.data.kind === 'llm');
+    const requiresImage = nodes.some((node) => reachableSet.has(node.id) && node.data.kind === 'image');
+    const missingCredentials = [requiresChat && !config?.chatConfigured ? '基础模型' : '', requiresImage && !config?.imageConfigured ? '图像模型' : ''].filter(Boolean);
+    if (missingCredentials.length) {
+      setConfigMessage({ kind: 'error', text: `当前工作流需要配置：${missingCredentials.join('、')} API Key` });
       setSettingsOpen(true);
       return;
     }
-    const startNodes = nodes.filter((node) => node.data.kind === 'start');
-    if (startNodes.length !== 1) {
-      setToast('运行失败：工作流需要且只能有一个开始节点');
-      return;
-    }
+    const startNode = nodes.find((node) => node.data.kind === 'start')!;
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
     stopRequestedRef.current = false;
     setRunning(true);
-    setResult({});
+    setResult(emptyOutputBundle());
     setDebugOpen(true);
     setWorkspaceView('editor');
     setActiveDebug('process');
-    setNodes((items) => items.map((node) => ({ ...node, data: { ...node.data, status: 'waiting' } })));
+    setNodes((items) => items.map((node) => ({ ...node, data: { ...node.data, status: reachableSet.has(node.id) ? 'waiting' : 'idle' } })));
     const started = performance.now();
     const logs: RunLog[] = [];
     const outputs = new Map<string, RuntimeOutput>();
     const skipped = new Set<string>();
-    let finalResult: WorkflowResult = {};
+    let finalResult = emptyOutputBundle();
     let recordStatus: RunRecord['status'] = 'success';
 
     const saveRecord = () => {
@@ -715,36 +790,17 @@ function App() {
       };
       setRunRecords((items) => {
         const next = [record, ...items].slice(0, 30);
-        localStorage.setItem('aiflow.demo.runs', JSON.stringify(next));
+        const persistent = next.map((item) => ({ ...item, result: outputBundleForStorage(item.result) }));
+        localStorage.setItem('aiflow.demo.runs', JSON.stringify(persistent));
         return next;
       });
     };
 
     try {
-      const reachable = new Set<string>();
-      const queue = [startNodes[0].id];
-      while (queue.length) {
-        const id = queue.shift()!;
-        if (reachable.has(id)) continue;
-        reachable.add(id);
-        edges.filter((edge) => edge.source === id).forEach((edge) => queue.push(edge.target));
-      }
-      const workflowNodes = nodes.filter((node) => reachable.has(node.id));
-      const workflowEdges = edges.filter((edge) => reachable.has(edge.source) && reachable.has(edge.target));
-      const indegree = new Map(workflowNodes.map((node) => [node.id, 0]));
-      workflowEdges.forEach((edge) => indegree.set(edge.target, (indegree.get(edge.target) || 0) + 1));
-      const ready = workflowNodes.filter((node) => indegree.get(node.id) === 0);
-      const ordered: Node<FlowData>[] = [];
-      while (ready.length) {
-        const node = ready.shift()!;
-        ordered.push(node);
-        workflowEdges.filter((edge) => edge.source === node.id).forEach((edge) => {
-          const next = (indegree.get(edge.target) || 0) - 1;
-          indegree.set(edge.target, next);
-          if (next === 0) ready.push(workflowNodes.find((item) => item.id === edge.target)!);
-        });
-      }
-      if (ordered.length !== workflowNodes.length) throw new Error('工作流存在环路，无法执行');
+      const workflowNodes = nodes.filter((node) => reachableSet.has(node.id));
+      const workflowEdges = edges.filter((edge) => reachableSet.has(edge.source) && reachableSet.has(edge.target));
+      const nodeById = new Map(workflowNodes.map((node) => [node.id, node]));
+      const layers = topologicalLayers({ nodes: workflowNodes, edges: workflowEdges });
 
       const edgeIsActive = (edge: Edge) => {
         if (skipped.has(edge.source) || !outputs.has(edge.source)) return false;
@@ -755,7 +811,7 @@ function App() {
         return branch === expected;
       };
 
-      for (const node of ordered) {
+      const executeNode = async (node: Node<FlowData>) => {
         if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
         const incoming = workflowEdges.filter((edge) => edge.target === node.id);
         const activeIncoming = incoming.filter(edgeIsActive);
@@ -764,7 +820,7 @@ function App() {
           setNodeStatus(node.id, 'skipped');
           logs.push({ id: node.id, title: node.data.title, detail: '条件分支未命中，已跳过', status: 'skipped' });
           setRunLogs([...logs]);
-          continue;
+          return;
         }
 
         const nodeStarted = performance.now();
@@ -773,7 +829,7 @@ function App() {
         setRunLogs([...logs]);
         setNodeStatus(node.id, 'running');
         const upstream = activeIncoming.map((edge) => outputs.get(edge.source)!).filter(Boolean);
-        const upstreamText = [...upstream].reverse().find((item) => item.text)?.text || input;
+        const upstreamText = upstream.map((item) => item.text).filter((value): value is string => Boolean(value)).join('\n\n') || input;
         let output: RuntimeOutput = {};
         let detail = '执行完成';
 
@@ -797,20 +853,25 @@ function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': apiKeys.imageApiKey },
             signal: controller.signal,
-            body: JSON.stringify({ prompt: upstreamText, size: node.data.imageSize || '1024x1024', quality: node.data.imageQuality || 'high', referenceImage })
+            body: JSON.stringify({ prompt: upstreamText, size: node.data.imageSize || '1024x1024', quality: node.data.imageQuality || 'high', count: node.data.imageCount || 1, referenceImage })
           });
           const data = await response.json();
           if (!response.ok) throw new Error(data.message || '图像模型调用失败');
-          const image = data.url || (data.base64 ? `data:image/png;base64,${data.base64}` : undefined);
           const [imageWidth, imageHeight] = String(node.data.imageSize || '1024x1024').split('x');
-          output = { text: upstreamText, image, imageAspectRatio: `${imageWidth} / ${imageHeight}`, value: data };
-          detail = data.simulated ? '渠道不可用，已使用品牌演示素材' : referenceImage ? '参考图扩展生成完成' : '图像生成完成';
+          const records = Array.isArray(data.images) && data.images.length ? data.images : [data];
+          const images = records.map((item: Record<string, unknown>, index: number) => {
+            const url = typeof item.url === 'string' && item.url ? item.url : typeof item.base64 === 'string' && item.base64 ? `data:image/png;base64,${item.base64}` : '';
+            return { url, name: `${node.data.title}-${index + 1}.png`, mimeType: 'image/png', aspectRatio: `${imageWidth} / ${imageHeight}` };
+          }).filter((asset: { url: string }) => Boolean(asset.url));
+          if (!images.length) throw new Error('图像服务未返回可用图片');
+          output = { text: upstreamText, images, value: data };
+          detail = data.simulated ? `渠道不可用，已返回 ${images.length} 张品牌演示素材` : referenceImage ? `参考图扩展生成完成 · ${images.length} 张` : `图像生成完成 · ${images.length} 张`;
         } else if (node.data.kind === 'condition') {
           const source = node.data.conditionSource === 'input' ? input : upstreamText;
           const expected = String(node.data.conditionValue || '');
           const actual = String(source || '');
           const operator = node.data.conditionOperator || 'contains';
-          const branch = operator === 'contains' ? actual.includes(expected) : operator === 'not_contains' ? !actual.includes(expected) : operator === 'equals' ? actual === expected : actual !== expected;
+          const branch = evaluateCondition(actual, expected, operator);
           output = { text: actual, value: actual, branch };
           detail = `条件结果：${branch ? 'true' : 'false'}`;
         } else if (node.data.kind === 'http') {
@@ -829,43 +890,83 @@ function App() {
           detail = `HTTP ${data.status}`;
         } else if (node.data.kind === 'code') {
           const context = Object.fromEntries(outputs.entries());
-          const value = await runCodeInWorker(node.data.code || 'return input;', upstream[0]?.value ?? upstreamText, context, controller.signal);
+          const codeInput = upstream.length > 1 ? upstream.map((item) => item.value ?? item.text ?? item.images) : upstream[0]?.value ?? upstreamText;
+          const value = await runCodeInWorker(node.data.code || 'return input;', codeInput, context, controller.signal);
           const normalized = typeof value === 'object' && value !== null ? value as Record<string, unknown> : { text: String(value ?? '') };
-          output = { value, text: typeof normalized.text === 'string' ? normalized.text : JSON.stringify(value, null, 2) };
+          const texts = Array.isArray(normalized.texts) ? normalized.texts.filter((item): item is string => typeof item === 'string') : undefined;
+          const images = Array.isArray(normalized.images) ? normalized.images.filter((item): item is string | { url: string } => typeof item === 'string' || Boolean(item && typeof item === 'object' && 'url' in item)) : undefined;
+          output = { value, text: typeof normalized.text === 'string' ? normalized.text : undefined, texts, images };
           detail = 'Worker 执行完成';
+        } else if (node.data.kind === 'aggregate') {
+          const aggregateTexts = upstream.flatMap((item) => [
+            ...(item.text ? [item.text] : []),
+            ...(item.texts || [])
+          ]);
+          const aggregateImages = upstream.flatMap((item) => [
+            ...(item.image ? [item.image] : []),
+            ...(item.images || [])
+          ]);
+          const aggregateFiles = upstream.flatMap((item) => item.files || []);
+          const entries = activeIncoming.map((edge) => ({
+            nodeId: edge.source,
+            title: nodeById.get(edge.source)?.data.title || edge.source,
+            value: outputs.get(edge.source)?.value ?? outputs.get(edge.source)?.text ?? outputs.get(edge.source)?.images ?? null
+          }));
+          const strategy = node.data.aggregateStrategy || 'object';
+          if (strategy === 'text') {
+            const text = upstream.map((item) => item.text).filter((value): value is string => Boolean(value)).join('\n\n');
+            output = { text, value: text };
+          } else if (strategy === 'array') {
+            output = { value: entries.map((entry) => entry.value), texts: aggregateTexts, images: aggregateImages, files: aggregateFiles };
+          } else {
+            output = { value: Object.fromEntries(entries.map((entry) => [entry.nodeId, entry.value])), texts: aggregateTexts, images: aggregateImages, files: aggregateFiles };
+          }
+          detail = `已聚合 ${entries.length} 个上游结果 · ${strategy}`;
         } else if (node.data.kind === 'output') {
-          const imageOutput = [...upstream].reverse().find((item) => item.image);
-          finalResult = {
-            text: [...upstream].reverse().find((item) => item.text)?.text,
-            image: imageOutput?.image,
-            imageAspectRatio: imageOutput?.imageAspectRatio,
-            files: upstream.flatMap((item) => item.files || [])
-          };
-          output = { ...finalResult, value: finalResult };
+          const seenTexts = new Set<string>();
+          const sources = activeIncoming.map((edge) => {
+            const sourceOutput = outputs.get(edge.source)!;
+            const visibleText = sourceOutput.text && !seenTexts.has(sourceOutput.text) ? sourceOutput.text : undefined;
+            if (visibleText) seenTexts.add(visibleText);
+            const hasDisplayValue = Boolean(sourceOutput.text || sourceOutput.texts?.length || sourceOutput.image || sourceOutput.images?.length || sourceOutput.files?.length);
+            return {
+              ...sourceOutput,
+              text: visibleText,
+              value: hasDisplayValue ? undefined : sourceOutput.value,
+              sourceNodeId: edge.source,
+              sourceTitle: nodeById.get(edge.source)?.data.title || edge.source
+            };
+          });
+          const normalizedGroup = normalizeRuntimeOutputGroup(node.id, node.data.title, sources);
+          const group = node.data.bindings?.length ? applyOutputBindings(normalizedGroup, node.data.bindings) : normalizedGroup;
+          group.key = node.data.outputKey || node.id;
+          finalResult = mergeOutputGroups(finalResult.groups, group);
+          output = { value: group };
           setResult(finalResult);
-          detail = '最终结果已组装';
+          detail = `已组装 ${group.items.length} 个结果项`;
         }
 
         outputs.set(node.id, output);
         setNodeStatus(node.id, 'success');
         logs[logIndex] = { ...logs[logIndex], status: 'success', detail, elapsed: `${((performance.now() - nodeStarted) / 1000).toFixed(1)}s` };
         setRunLogs([...logs]);
+      };
+
+      for (const layer of layers) {
+        await Promise.all(layer.map((id) => executeNode(nodeById.get(id)!)));
       }
 
-      if (!Object.keys(finalResult).length) {
-        const last = outputs.get(ordered.at(-1)?.id || '') || {};
-        finalResult = { text: last.text, image: last.image, imageAspectRatio: last.imageAspectRatio, files: last.files };
-        setResult(finalResult);
-      }
+      if (!finalResult.groups.length) throw new Error(`没有可达的结束节点，起点为 ${startNode.data.title}`);
       setActiveDebug('output');
     } catch (error) {
       const cancelled = stopRequestedRef.current || (error instanceof DOMException && error.name === 'AbortError');
+      if (!cancelled) controller.abort();
       recordStatus = cancelled ? 'cancelled' : 'error';
       const message = cancelled ? '运行已由用户停止' : error instanceof Error ? error.message : '运行失败';
       setNodes((items) => items.map((node) => node.data.status === 'running' || node.data.status === 'waiting' ? { ...node, data: { ...node.data, status: cancelled ? 'cancelled' : 'error' } } : node));
       logs.forEach((log, index) => { if (log.status === 'running') logs[index] = { ...log, status: cancelled ? 'muted' : 'error', detail: message }; });
       setRunLogs([...logs]);
-      finalResult = cancelled ? { notice: message } : { error: message };
+      finalResult = { ...emptyOutputBundle(), ...(cancelled ? { notice: message } : { error: message }) };
       setResult(finalResult);
       setActiveDebug('logs');
     } finally {
@@ -883,7 +984,7 @@ function App() {
           <BrandMark />
           <span className="header-divider" />
           <div className="workflow-title">
-            <strong>社媒主视觉生成器</strong>
+            <strong>{workflowTitle}</strong>
             <span><Check size={12} /> 已保存</span>
           </div>
         </div>
@@ -894,6 +995,10 @@ function App() {
         </nav>
         <div className="header-actions">
           <button className="icon-button" aria-label="撤销" onClick={undo} disabled={!undoStack.length || running}><Undo2 size={17} /></button>
+          <button className="icon-button" aria-label="复制工作流 JSON" onClick={() => void copyWorkflow()}><ClipboardCopy size={17} /></button>
+          <button className="icon-button" aria-label="导出工作流" onClick={exportWorkflow}><FileDown size={17} /></button>
+          <button className="icon-button" aria-label="导入工作流" onClick={() => importWorkflowRef.current?.click()}><FileUp size={17} /></button>
+          <input ref={importWorkflowRef} className="visually-hidden" type="file" accept="application/json,.json,.aiflow.json" onChange={(event) => { importWorkflow(event.target.files?.[0]); event.target.value = ''; }} />
           <button className="ghost-button" onClick={openSettings}><Settings size={16} /> 模型配置</button>
           {running ? <button className="stop-button" onClick={stopWorkflow}><Square size={14} fill="currentColor" /> 停止运行</button> : <button className="run-button" onClick={runWorkflow}><Play size={16} fill="currentColor" />试运行</button>}
           <button className="publish-button" onClick={publishWorkflow} disabled={running}><Rocket size={16} /> 发布</button>
@@ -907,6 +1012,7 @@ function App() {
             <button className="icon-button tiny" aria-label="折叠节点库" onClick={() => setLibraryOpen(false)}><Menu size={16} /></button>
           </div>
           <label className="search-box"><Search size={15} /><input value={nodeSearch} onChange={(event) => setNodeSearch(event.target.value)} placeholder="搜索节点" /></label>
+          <button className="preset-launcher" onClick={() => setPresetOpen(true)}><LayoutTemplate size={16} /><span><strong>电商场景预设</strong><small>4 个可运行模板 · 多图多文案</small></span><ChevronDown size={14} /></button>
           <div className="node-groups">
             {['输入输出', 'AI 能力', '逻辑', '工具'].map((group) => {
               const kinds = filteredKinds.filter((kind) => nodeMeta[kind].group === group);
@@ -930,7 +1036,7 @@ function App() {
 
         <section className="canvas-wrap">
           {workspaceView === 'editor' ? <>
-          <div className="canvas-breadcrumb"><span>工作流</span><b>/</b><strong>社媒主视觉生成器</strong></div>
+          <div className="canvas-breadcrumb"><span>工作流</span><b>/</b><strong>{workflowTitle}</strong></div>
           <ReactFlow
             nodes={nodes}
             edges={edges}
@@ -1012,6 +1118,7 @@ function App() {
                 </button>)}
               </div>
               <label>质量<select value={selectedNode.data.imageQuality || 'high'} onChange={(event) => updateSelected({ imageQuality: event.target.value as FlowData['imageQuality'] })}><option value="high">High</option><option value="medium">Medium</option></select></label>
+              <label>生成数量<select value={selectedNode.data.imageCount || 1} onChange={(event) => updateSelected({ imageCount: Number(event.target.value), subtitle: `${selectedNode.data.model || 'gpt-image-2'} · ${aspectRatioLabel((selectedNode.data.imageSize || '1024x1024').replace('x', ' / '))} · ${event.target.value} 张` })}><option value="1">1 张</option><option value="2">2 张</option><option value="3">3 张</option><option value="4">4 张</option></select></label>
               <div className="ratio-note"><ImageIcon size={14} /><span><strong>尺寸兼容提醒</strong>实际输出以模型渠道支持为准；不支持任意尺寸时，网关可能返回参数错误或进行适配裁切。</span></div>
             </div>}
             {selectedNode.data.kind === 'condition' && <div className="form-section">
@@ -1033,9 +1140,19 @@ function App() {
               <label>执行代码<textarea className="code-editor" rows={9} value={selectedNode.data.code || ''} onChange={(event) => updateSelected({ code: event.target.value })} /></label>
               <div className="code-note">在独立 Web Worker 中运行，使用 <code>input</code> 和 <code>context</code>，最长 5 秒。</div>
             </div>}
+            {selectedNode.data.kind === 'aggregate' && <div className="form-section">
+              <h3>聚合方式</h3>
+              <label>结果结构<select value={selectedNode.data.aggregateStrategy || 'object'} onChange={(event) => updateSelected({ aggregateStrategy: event.target.value as FlowData['aggregateStrategy'], subtitle: `按来源聚合 · ${event.target.value}` })}><option value="object">对象（按节点 ID）</option><option value="array">数组（保持连线顺序）</option><option value="text">合并文本</option></select></label>
+              <div className="code-note">接收多个上游结果并保留原始顺序，适合汇总多文案、多图片和结构化数据。</div>
+            </div>}
+            {selectedNode.data.kind === 'output' && <div className="form-section">
+              <h3>输出分组</h3>
+              <label>输出 Key<input value={selectedNode.data.outputKey || ''} onChange={(event) => updateSelected({ outputKey: event.target.value })} placeholder="例如 xiaohongshu_assets" /></label>
+              <div className="code-note">每个结束节点形成一个独立输出组；连接到该节点的所有文字、图片和文件都会保留。</div>
+            </div>}
             <div className="form-section output-schema">
               <h3>输出</h3>
-              <div><FileJson size={15} /><span>output</span><code>{selectedNode.data.kind === 'image' ? 'asset' : selectedNode.data.kind === 'condition' ? 'boolean' : selectedNode.data.kind === 'http' ? 'object' : selectedNode.data.kind === 'code' ? 'any' : 'string'}</code></div>
+              <div><FileJson size={15} /><span>output</span><code>{selectedNode.data.kind === 'image' ? 'asset[]' : selectedNode.data.kind === 'condition' ? 'boolean' : selectedNode.data.kind === 'http' || selectedNode.data.kind === 'aggregate' ? 'object' : selectedNode.data.kind === 'code' ? 'any' : selectedNode.data.kind === 'output' ? 'output-group' : 'string'}</code></div>
             </div>
             <div className="form-section danger-zone"><button onClick={() => deleteNode(selectedNode.id)}><Trash2 size={14} />删除此节点</button><small>删除后连接会一并移除，可使用撤销恢复。</small></div>
           </div> : <div className="empty-panel">选择一个节点查看配置</div>}
@@ -1073,22 +1190,7 @@ function App() {
             </div>
             <div className="run-output">
               {activeDebug === 'process' && <div className="run-timeline">{runLogs.map((log) => <div className={`timeline-item ${log.status}`} key={log.id}><span className="timeline-status">{log.status === 'success' ? <Check size={13} /> : log.status === 'running' ? <LoaderCircle className="spin" size={13} /> : log.status === 'error' ? <X size={13} /> : <span />}</span><div><strong>{log.title}</strong><small>{log.detail}</small></div><time>{log.elapsed}</time></div>)}</div>}
-              {activeDebug === 'output' && <div className="output-box">
-                <div className="output-box-head"><div><strong>工作流输出</strong><small>文字、图像与文件统一接取</small></div><span className={result.text || result.image || result.files?.length ? 'has-output' : ''}>{result.text || result.image || result.files?.length ? '已生成' : '等待输出'}</span></div>
-                {!result.text && !result.image && !result.files?.length && <div className="output-empty"><FileJson size={24} /><strong>尚无输出结果</strong><span>运行完成后，可在这里复制文字或下载生成资产</span></div>}
-                {result.text && <section className="output-item text-output">
-                  <header><div><FileText size={15} /><span><strong>文字输出</strong><small>text / plain</small></span></div><div><button type="button" onClick={copyOutputText}>{copied ? <Check size={13} /> : <Copy size={13} />}{copied ? '已复制' : '复制'}</button><button type="button" onClick={downloadOutputText}><Download size={13} />下载 TXT</button></div></header>
-                  <p>{result.text}</p>
-                </section>}
-                {result.image && <section className="output-item image-output">
-                  <button type="button" className="image-result-trigger" aria-label="预览生成图片" style={outputImageStyle(result.imageAspectRatio)} onClick={() => setImagePreviewOpen(true)}>
-                    <img src={result.image} alt="工作流生成结果" onLoad={(event) => { const image = event.currentTarget; if (image.naturalWidth && image.naturalHeight) setResult((previous) => ({ ...previous, imageAspectRatio: `${image.naturalWidth} / ${image.naturalHeight}` })); }} />
-                    <span><ZoomIn size={16} />单击预览</span>
-                  </button>
-                  <div><span><ImageIcon size={15} /><strong>图像输出</strong></span><small>PNG · {aspectRatioLabel(result.imageAspectRatio)}</small><button type="button" onClick={() => downloadOutputAsset(result.image!, 'workflow-image.png')}><Download size={13} />下载图片</button></div>
-                </section>}
-                {result.files?.map((file) => <section className="output-item file-output" key={file.url}><FileJson size={17} /><div><strong>{file.name}</strong><small>{file.mimeType || 'application/octet-stream'}</small></div><button type="button" onClick={() => downloadOutputAsset(file.url, file.name)}><Download size={13} />下载</button></section>)}
-              </div>}
+              {activeDebug === 'output' && <div className="output-box"><OutputPanel bundle={result} onError={(message) => setResult((previous) => ({ ...previous, error: message }))} /></div>}
               {activeDebug === 'logs' && <div className={`log-view ${result.error ? 'error' : ''}`}><TerminalSquare size={17} /><pre>{result.error ? `[ERROR] ${result.error}` : result.notice ? `[INFO] ${result.notice}` : '[INFO] 暂无错误日志\n[INFO] 本地 API 网关已就绪'}</pre></div>}
             </div>
           </div>
@@ -1098,10 +1200,16 @@ function App() {
 
       {toast && <div className="toast" role="status">{toast}</div>}
 
-      {imagePreviewOpen && result.image && <div className="image-preview-backdrop" role="presentation" onMouseDown={() => setImagePreviewOpen(false)}>
-        <section className="image-preview-dialog" role="dialog" aria-modal="true" aria-label="图片预览" onMouseDown={(event) => event.stopPropagation()}>
-          <header><div><ImageIcon size={16} /><span><strong>生成结果预览</strong><small>{aspectRatioLabel(result.imageAspectRatio)} · 单击空白处或按 Esc 关闭</small></span></div><div><button onClick={() => downloadOutputAsset(result.image!, 'workflow-image.png')}><Download size={15} />下载</button><button className="icon-button" aria-label="关闭图片预览" onClick={() => setImagePreviewOpen(false)}><X size={18} /></button></div></header>
-          <div className="image-preview-stage"><img src={result.image} alt="生成结果大图预览" /></div>
+      {presetOpen && <div className="modal-backdrop" role="presentation" onMouseDown={() => setPresetOpen(false)}>
+        <section className="preset-dialog" role="dialog" aria-modal="true" aria-label="电商工作流预设" onMouseDown={(event) => event.stopPropagation()}>
+          <header><div><span className="modal-icon"><LayoutTemplate size={18} /></span><div><strong>电商工作流预设</strong><small>载入后生成完整节点与连线，可继续编辑、复制和导出</small></div></div><button className="icon-button" aria-label="关闭预设" onClick={() => setPresetOpen(false)}><X size={18} /></button></header>
+          <div className="preset-grid">{ecommerceWorkflowPresets.map((preset) => <article className="preset-card" key={preset.id}>
+            <div className="preset-card-head"><span>{preset.id === 'ecommerce-multichannel-campaign' ? <ImageIcon size={18} /> : preset.id === 'ecommerce-product-detail-copy' ? <MessageSquareText size={18} /> : <LayoutTemplate size={18} />}</span><div><strong>{preset.name}</strong><small>{preset.category} · v{preset.version}</small></div>{preset.tags.includes('多输出') && <b>多输出</b>}</div>
+            <p>{preset.description}</p>
+            <div className="preset-stats"><span>{preset.nodes.length} 节点</span><span>{preset.edges.length} 连线</span><span>{preset.expectedOutputs.length} 输出</span></div>
+            <div className="preset-output-list">{preset.expectedOutputs.slice(0, 4).map((output) => <span key={output.key}>{output.type === 'image' ? <ImageIcon size={12} /> : <FileText size={12} />}{output.label}</span>)}</div>
+            <footer><small>需要：{preset.requiredCredentials.length ? preset.requiredCredentials.map((credential) => credential === 'chat' ? '基础模型' : '图像模型').join('、') : '无需模型凭证'}</small><button type="button" onClick={() => applyPreset(preset)}>使用模板</button></footer>
+          </article>)}</div>
         </section>
       </div>}
 

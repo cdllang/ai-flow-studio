@@ -6,13 +6,16 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently -k -n WEB,API -c cyan,green \"vite\" \"node --watch server.mjs\"",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
     "build": "tsc --noEmit && vite build",
     "start": "node server.mjs",
     "verify:config": "node scripts/verify-config.mjs",
     "verify:features": "node scripts/verify-features.mjs",
     "verify:interactions": "node scripts/verify-interactions.mjs",
     "verify:ratios": "node scripts/verify-ratios.mjs",
-    "verify:preview": "node scripts/verify-image-preview.mjs"
+    "verify:preview": "node scripts/verify-image-preview.mjs",
+    "verify:multi-output": "node scripts/verify-multi-output.mjs"
   },
   "dependencies": {
     "@xyflow/react": "^12.9.2",

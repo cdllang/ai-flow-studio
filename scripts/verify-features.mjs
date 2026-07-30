@@ -1,4 +1,9 @@
 import { chromium } from 'playwright-core';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const screenshotDir = path.resolve('.verification');
+fs.mkdirSync(screenshotDir, { recursive: true });
 
 const browser = await chromium.launch({
   headless: true,
@@ -32,7 +37,7 @@ await page.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
 const autoConfigDialog = await page.getByRole('dialog', { name: '模型配置' }).isVisible();
 await page.getByRole('button', { name: '关闭模型配置' }).click();
 const closeBlocked = await page.getByRole('dialog', { name: '模型配置' }).isVisible();
-await page.screenshot({ path: 'auto-config-modal.png', fullPage: true });
+await page.screenshot({ path: path.join(screenshotDir, 'auto-config-modal.png'), fullPage: true });
 
 const mockPage = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
 await mockPage.addInitScript(() => localStorage.setItem('aiflow.demo.apiKeys', JSON.stringify({ chatApiKey: 'test-chat-key', imageApiKey: 'test-image-key' })));
@@ -79,18 +84,18 @@ await mockPage.locator('#reference-image-input').setInputFiles('public/assets/ca
 await mockPage.getByAltText('参考图片预览').waitFor();
 const referencePreview = await mockPage.getByAltText('参考图片预览').isVisible();
 await mockPage.locator('.test-input > button').click();
-await mockPage.getByText('文字输出').waitFor();
-await mockPage.getByText('图像输出').waitFor();
+await mockPage.locator('.output-copy-card').waitFor();
+await mockPage.locator('.output-image-card').waitFor();
 await mockPage.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'http://127.0.0.1:14590' });
-await mockPage.getByRole('button', { name: '复制' }).click();
+await mockPage.locator('.output-copy-card').getByRole('button', { name: '复制' }).click();
 const copySucceeded = await mockPage.getByRole('button', { name: '已复制' }).isVisible();
 const textDownload = mockPage.waitForEvent('download');
-await mockPage.getByRole('button', { name: '下载 TXT' }).click();
+await mockPage.getByRole('button', { name: '导出结果' }).click();
 const textDownloadName = (await textDownload).suggestedFilename();
 const imageDownload = mockPage.waitForEvent('download');
-await mockPage.getByRole('button', { name: '下载图片' }).click();
+await mockPage.locator('.output-image-card').getByRole('button', { name: /^下载 / }).click();
 const imageDownloadName = (await imageDownload).suggestedFilename();
-await mockPage.screenshot({ path: 'reference-output.png', fullPage: true });
+await mockPage.screenshot({ path: path.join(screenshotDir, 'reference-output.png'), fullPage: true });
 await mockPage.setViewportSize({ width: 1100, height: 760 });
 await mockPage.waitForTimeout(250);
 const compactLayout = await mockPage.evaluate(() => ({
@@ -104,11 +109,11 @@ const result = {
   autoConfigDialog,
   closeBlocked,
   referencePreview,
-  textOutputVisible: await mockPage.getByText('文字输出').isVisible(),
-  imageOutputVisible: await mockPage.getByText('图像输出').isVisible(),
+  textOutputVisible: await mockPage.locator('.output-copy-card').isVisible(),
+  imageOutputVisible: await mockPage.locator('.output-image-card').isVisible(),
   copySucceeded,
-  textDownloadVisible: await mockPage.getByRole('button', { name: '下载 TXT' }).isVisible(),
-  imageDownloadVisible: await mockPage.getByRole('button', { name: '下载图片' }).isVisible(),
+  textDownloadVisible: await mockPage.getByRole('button', { name: '导出结果' }).isVisible(),
+  imageDownloadVisible: await mockPage.locator('.output-image-card').getByRole('button', { name: /^下载 / }).isVisible(),
   textDownloadName,
   imageDownloadName,
   chatKeyForwarded,
