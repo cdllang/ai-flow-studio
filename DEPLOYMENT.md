@@ -1,6 +1,6 @@
 # AIFlow Studio Docker 部署
 
-服务默认监听 `0.0.0.0:14590`，模型 Base URL 与模型名称保持项目原配置。API Key 不包含在镜像或发布包中，首次打开页面时由用户手动填写并保存在当前浏览器的 `localStorage`。
+服务默认监听 `0.0.0.0:14590`。页面默认填写项目原 Base URL 与模型名称，用户可以修改；连接参数和 API Key 均保存在当前浏览器的 `localStorage`，不包含在镜像或发布包中。
 
 ## 推荐部署：拉取 GitHub 预构建镜像
 
@@ -41,9 +41,9 @@ curl http://127.0.0.1:14590/api/health
 docker compose logs -f --tail=100
 ```
 
-## API Key 保存位置
+## 浏览器配置保存位置
 
-当前内测版本把两类 API Key 保存在访问该站点的浏览器 `localStorage`：
+当前内测版本把 Base URL、两类模型名称和两类 API Key 保存在访问该站点的浏览器 `localStorage`：
 
 ```text
 aiflow.demo.apiKeys
@@ -84,5 +84,6 @@ http://127.0.0.1:14590
 | `AIWANAI_DEFAULT_CHAT_MODEL` | `gpt-5.4-mini` |
 | `AIWANAI_IMAGE_MODEL` | `gpt-image-2-count` |
 | `IMAGE_DEMO_FALLBACK` | `false` |
+| `ALLOW_PRIVATE_MODEL_BASE_URL` | `false`；仅在明确需要连接可信内网模型服务时设为 `true` |
 
-不要通过 Compose 明文填写 API Key。当前版本使用平台页面写入浏览器 `localStorage`，正式生产再接入专用密钥服务。
+不要通过 Compose 明文填写 API Key。当前版本使用平台页面写入浏览器 `localStorage`，正式生产再接入专用密钥服务。为防止 SSRF，用户填写的 Base URL 默认不能指向 localhost 或私网地址。

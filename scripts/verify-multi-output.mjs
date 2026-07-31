@@ -10,7 +10,7 @@ const origin = `http://127.0.0.1:${port}`;
 const edgePath = process.env.EDGE_PATH || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
 const server = spawn(process.execPath, ['server.mjs'], {
   cwd: process.cwd(),
-  env: { ...process.env, HOST: '127.0.0.1', PORT: String(port), NODE_ENV: 'production', STATIC_DIR: '.tmp-build' },
+  env: { ...process.env, HOST: '127.0.0.1', PORT: String(port), NODE_ENV: 'production', STATIC_DIR: process.env.STATIC_DIR || 'dist' },
   stdio: ['ignore', 'pipe', 'pipe']
 });
 

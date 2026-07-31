@@ -60,6 +60,12 @@ import {
 } from 'lucide-react';
 import { OutputPanel } from './components/OutputPanel';
 import {
+  fallbackModelConfig,
+  normalizeModelConnectionConfig,
+  validateModelConnectionConfig,
+  type ModelConnectionConfig
+} from './modelConfig';
+import {
   applyOutputBindings,
   createWorkflowExport,
   evaluateCondition,
@@ -109,7 +115,7 @@ type ApiStatus = {
   imageModel: string;
 };
 
-type StoredApiKeys = {
+type StoredApiKeys = ModelConnectionConfig & {
   chatApiKey: string;
   imageApiKey: string;
 };
@@ -282,21 +288,38 @@ function loadStoredApiKeys(): StoredApiKeys {
     const value = JSON.parse(localStorage.getItem(apiKeysStorageKey) || '{}');
     return {
       chatApiKey: typeof value.chatApiKey === 'string' ? value.chatApiKey : '',
-      imageApiKey: typeof value.imageApiKey === 'string' ? value.imageApiKey : ''
+      imageApiKey: typeof value.imageApiKey === 'string' ? value.imageApiKey : '',
+      baseUrl: typeof value.baseUrl === 'string' ? value.baseUrl : '',
+      chatModel: typeof value.chatModel === 'string' ? value.chatModel : '',
+      imageModel: typeof value.imageModel === 'string' ? value.imageModel : ''
     };
   } catch {
-    return { chatApiKey: '', imageApiKey: '' };
+    return { chatApiKey: '', imageApiKey: '', baseUrl: '', chatModel: '', imageModel: '' };
   }
 }
 
 function statusWithLocalKeys(status: ApiStatus, keys: StoredApiKeys): ApiStatus {
   return {
     ...status,
+    baseUrl: keys.baseUrl || status.baseUrl,
+    defaultChatModel: keys.chatModel || status.defaultChatModel,
+    imageModel: keys.imageModel || status.imageModel,
     chatConfigured: Boolean(keys.chatApiKey),
     imageConfigured: Boolean(keys.imageApiKey),
     chatKeyHint: keys.chatApiKey ? `••••${keys.chatApiKey.slice(-4)}` : null,
     imageKeyHint: keys.imageApiKey ? `••••${keys.imageApiKey.slice(-4)}` : null
   };
+}
+
+function syncNodeModels(items: Node<FlowData>[], modelConfig: ModelConnectionConfig): Node<FlowData>[] {
+  return items.map((node) => {
+    if (node.data.kind === 'llm') return { ...node, data: { ...node.data, model: modelConfig.chatModel, subtitle: modelConfig.chatModel } };
+    if (node.data.kind === 'image') {
+      const suffix = node.data.subtitle.includes(' · ') ? ` · ${node.data.subtitle.split(' · ').slice(1).join(' · ')}` : '';
+      return { ...node, data: { ...node.data, model: modelConfig.imageModel, subtitle: `${modelConfig.imageModel}${suffix}` } };
+    }
+    return node;
+  });
 }
 
 function cleanSnapshot(nodes: Node<FlowData>[], edges: Edge[]): WorkflowSnapshot {
@@ -425,6 +448,9 @@ function App() {
   const [draggingImage, setDraggingImage] = useState(false);
   const [apiKeys, setApiKeys] = useState<StoredApiKeys>(loadStoredApiKeys);
   const [config, setConfig] = useState<ApiStatus | null>(null);
+  const [baseUrlInput, setBaseUrlInput] = useState('');
+  const [chatModelInput, setChatModelInput] = useState('');
+  const [imageModelInput, setImageModelInput] = useState('');
   const [chatApiKey, setChatApiKey] = useState('');
   const [imageApiKey, setImageApiKey] = useState('');
   const [clearChatKey, setClearChatKey] = useState(false);
@@ -436,13 +462,25 @@ function App() {
   const stopRequestedRef = useRef(false);
   const importWorkflowRef = useRef<HTMLInputElement | null>(null);
   const selectedNode = nodes.find((node) => node.id === selectedId);
+  const configuredChatModel = apiKeys.chatModel || config?.defaultChatModel || fallbackModelConfig.chatModel;
+  const configuredImageModel = apiKeys.imageModel || config?.imageModel || fallbackModelConfig.imageModel;
 
   useEffect(() => {
     fetch('/api/config/status')
       .then((response) => response.json())
       .then((status: ApiStatus) => {
-        const localStatus = statusWithLocalKeys(status, apiKeys);
+        const resolvedConnection = normalizeModelConnectionConfig(apiKeys, {
+          baseUrl: status.baseUrl,
+          chatModel: status.defaultChatModel,
+          imageModel: status.imageModel
+        });
+        const resolvedKeys = { ...apiKeys, ...resolvedConnection };
+        const localStatus = statusWithLocalKeys(status, resolvedKeys);
+        setApiKeys(resolvedKeys);
         setConfig(localStatus);
+        setBaseUrlInput(localStatus.baseUrl);
+        setChatModelInput(localStatus.defaultChatModel);
+        setImageModelInput(localStatus.imageModel);
         if (!localStatus.chatConfigured || !localStatus.imageConfigured) {
           setConfigMessage({ kind: 'error', text: '请先配置基础模型和图像模型 API Key，再运行工作流' });
           setSettingsOpen(true);
@@ -529,6 +567,9 @@ function App() {
   };
 
   const openSettings = () => {
+    setBaseUrlInput(config?.baseUrl || apiKeys.baseUrl || fallbackModelConfig.baseUrl);
+    setChatModelInput(config?.defaultChatModel || apiKeys.chatModel || fallbackModelConfig.chatModel);
+    setImageModelInput(config?.imageModel || apiKeys.imageModel || fallbackModelConfig.imageModel);
     setChatApiKey('');
     setImageApiKey('');
     setClearChatKey(false);
@@ -549,26 +590,39 @@ function App() {
     setConfigSaving(true);
     setConfigMessage(null);
     try {
+      const connection = normalizeModelConnectionConfig({
+        baseUrl: baseUrlInput,
+        chatModel: chatModelInput,
+        imageModel: imageModelInput
+      }, {
+        baseUrl: config?.baseUrl || fallbackModelConfig.baseUrl,
+        chatModel: config?.defaultChatModel || fallbackModelConfig.chatModel,
+        imageModel: config?.imageModel || fallbackModelConfig.imageModel
+      });
+      const validationError = validateModelConnectionConfig(connection);
+      if (validationError) throw new Error(validationError);
       const nextKeys = {
         chatApiKey: clearChatKey ? '' : chatApiKey.trim() || apiKeys.chatApiKey,
-        imageApiKey: clearImageKey ? '' : imageApiKey.trim() || apiKeys.imageApiKey
+        imageApiKey: clearImageKey ? '' : imageApiKey.trim() || apiKeys.imageApiKey,
+        ...connection
       };
       localStorage.setItem(apiKeysStorageKey, JSON.stringify(nextKeys));
       setApiKeys(nextKeys);
       setConfig((current) => statusWithLocalKeys(current || {
-        baseUrl: 'https://ai.aiwanai.com.cn/v1',
+        baseUrl: fallbackModelConfig.baseUrl,
         chatConfigured: false,
         imageConfigured: false,
         chatKeyHint: null,
         imageKeyHint: null,
-        defaultChatModel: 'gpt-5.4-mini',
-        imageModel: 'gpt-image-2-count'
+        defaultChatModel: fallbackModelConfig.chatModel,
+        imageModel: fallbackModelConfig.imageModel
       }, nextKeys));
+      setNodes((items) => syncNodeModels(items, connection));
       setChatApiKey('');
       setImageApiKey('');
       setClearChatKey(false);
       setClearImageKey(false);
-      setConfigMessage({ kind: 'success', text: 'API Key 已保存到当前浏览器并立即生效' });
+      setConfigMessage({ kind: 'success', text: '连接参数与 API Key 已保存到当前浏览器并立即生效' });
     } catch (error) {
       setConfigMessage({ kind: 'error', text: error instanceof Error ? error.message : '配置保存失败' });
     } finally {
@@ -639,7 +693,8 @@ function App() {
         const importedNodes = document.workflow.nodes as unknown as Node<FlowData>[];
         if (importedNodes.some((node) => !node.data?.kind || !(node.data.kind in nodeMeta))) throw new Error('工作流包含当前版本不支持的节点');
         rememberSnapshot();
-        setNodes(importedNodes.map((node) => ({ ...node, data: { ...node.data, status: 'idle' } })));
+        const cleanImportedNodes = importedNodes.map((node) => ({ ...node, data: { ...node.data, status: 'idle' as NodeStatus } }));
+        setNodes(syncNodeModels(cleanImportedNodes, normalizeModelConnectionConfig(apiKeys)));
         setEdges(document.workflow.edges as Edge[]);
         setWorkflowTitle(typeof document.workflow.title === 'string' ? document.workflow.title : file.name.replace(/\.aiflow\.json$|\.json$/i, ''));
         setInput(typeof document.workflow.input === 'string' ? document.workflow.input : '');
@@ -659,7 +714,7 @@ function App() {
     if (nodes.length && !window.confirm(`使用“${preset.name}”将替换当前画布，是否继续？替换后仍可点击撤销恢复结构。`)) return;
     rememberSnapshot();
     const instance = instantiatePreset(preset);
-    setNodes(instance.nodes as unknown as Node<FlowData>[]);
+    setNodes(syncNodeModels(instance.nodes as unknown as Node<FlowData>[], normalizeModelConnectionConfig(apiKeys)));
     setEdges(instance.edges as Edge[]);
     setWorkflowTitle(instance.name);
     setInput(instance.sampleInput);
@@ -674,6 +729,7 @@ function App() {
 
   const addNode = (kind: NodeKind) => {
     rememberSnapshot();
+    const connection = normalizeModelConnectionConfig(apiKeys);
     const count = nodes.filter((node) => node.data.kind === kind).length + 1;
     const id = `${kind}-${Date.now()}`;
     const node: Node<FlowData> = {
@@ -683,14 +739,15 @@ function App() {
       data: {
         kind,
         title: `${nodeMeta[kind].label} ${count}`,
-        subtitle: kind === 'condition' ? '判断上游文本' : kind === 'http' ? 'GET · 未配置 URL' : kind === 'code' ? 'JavaScript · Worker' : kind === 'aggregate' ? '按来源聚合 · object' : '点击配置节点',
+        subtitle: kind === 'condition' ? '判断上游文本' : kind === 'http' ? 'GET · 未配置 URL' : kind === 'code' ? 'JavaScript · Worker' : kind === 'aggregate' ? '按来源聚合 · object' : kind === 'llm' ? connection.chatModel : kind === 'image' ? `${connection.imageModel} · 1:1 · 1024×1024` : '点击配置节点',
         status: 'idle',
         ...(kind === 'condition' ? { conditionSource: 'upstream', conditionOperator: 'contains', conditionValue: '' } : {}),
         ...(kind === 'http' ? { httpMethod: 'GET', httpUrl: '', httpHeaders: '{}', httpBody: '' } : {}),
         ...(kind === 'code' ? { code: 'return { text: String(input ?? "") };' } : {}),
         ...(kind === 'aggregate' ? { aggregateStrategy: 'object' } : {}),
         ...(kind === 'output' ? { outputKey: `output_${count}` } : {}),
-        ...(kind === 'image' ? { model: 'gpt-image-2', imageSize: '1024x1024', imageQuality: 'high', imageCount: 1 } : {})
+        ...(kind === 'llm' ? { model: connection.chatModel } : {}),
+        ...(kind === 'image' ? { model: connection.imageModel, imageSize: '1024x1024', imageQuality: 'high', imageCount: 1 } : {})
       }
     };
     setNodes((items) => [...items, node]);
@@ -842,7 +899,7 @@ function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': apiKeys.chatApiKey },
             signal: controller.signal,
-            body: JSON.stringify({ prompt: upstreamText, system: node.data.prompt, model: node.data.model })
+            body: JSON.stringify({ prompt: upstreamText, system: node.data.prompt, baseUrl: apiKeys.baseUrl, model: node.data.model || apiKeys.chatModel })
           });
           const data = await response.json();
           if (!response.ok) throw new Error(data.message || '基础模型调用失败');
@@ -853,7 +910,7 @@ function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': apiKeys.imageApiKey },
             signal: controller.signal,
-            body: JSON.stringify({ prompt: upstreamText, size: node.data.imageSize || '1024x1024', quality: node.data.imageQuality || 'high', count: node.data.imageCount || 1, referenceImage })
+            body: JSON.stringify({ prompt: upstreamText, size: node.data.imageSize || '1024x1024', quality: node.data.imageQuality || 'high', count: node.data.imageCount || 1, referenceImage, baseUrl: apiKeys.baseUrl, model: node.data.model || apiKeys.imageModel })
           });
           const data = await response.json();
           if (!response.ok) throw new Error(data.message || '图像模型调用失败');
@@ -1086,10 +1143,14 @@ function App() {
               <h3>模型</h3>
               <label>模型 ID
                 <select value={selectedNode.data.model || ''} onChange={(event) => updateSelected({ model: event.target.value, subtitle: event.target.value })}>
-                  {selectedNode.data.kind === 'image' ? <option value="gpt-image-2">gpt-image-2</option> : <>
-                    <option value="gpt-5.4-mini">gpt-5.4-mini</option>
-                    <option value="gpt-5.6-terra">gpt-5.6-terra</option>
-                    <option value="gpt-5.6-sol">gpt-5.6-sol</option>
+                  {selectedNode.data.kind === 'image' ? <>
+                    <option value={configuredImageModel}>{configuredImageModel}（当前连接）</option>
+                    {configuredImageModel !== 'gpt-image-2' && <option value="gpt-image-2">gpt-image-2</option>}
+                  </> : <>
+                    <option value={configuredChatModel}>{configuredChatModel}（当前连接）</option>
+                    {configuredChatModel !== 'gpt-5.4-mini' && <option value="gpt-5.4-mini">gpt-5.4-mini</option>}
+                    {configuredChatModel !== 'gpt-5.6-terra' && <option value="gpt-5.6-terra">gpt-5.6-terra</option>}
+                    {configuredChatModel !== 'gpt-5.6-sol' && <option value="gpt-5.6-sol">gpt-5.6-sol</option>}
                   </>}
                 </select>
               </label>
@@ -1217,7 +1278,14 @@ function App() {
         <section className="settings-modal" role="dialog" aria-modal="true" aria-label="模型配置" onMouseDown={(event) => event.stopPropagation()}>
           <header><div><span className="modal-icon"><Settings size={18} /></span><div><strong>模型服务配置</strong><small>{config?.chatConfigured && config?.imageConfigured ? 'OpenAI 兼容网关' : '首次使用需要完成 API Key 配置'}</small></div></div><button className="icon-button" onClick={closeSettings} aria-label="关闭模型配置"><X size={18} /></button></header>
           <div className="settings-body">
-            <div className="gateway-card"><span>API Base URL</span><code>{config?.baseUrl || 'https://ai.aiwanai.com.cn/v1'}</code></div>
+            <div className="provider-fields">
+              <div className="provider-fields-head"><div><strong>连接参数</strong><small>默认沿用原网关与模型，可按服务商配置修改</small></div><button type="button" onClick={() => { setBaseUrlInput(fallbackModelConfig.baseUrl); setChatModelInput(fallbackModelConfig.chatModel); setImageModelInput(fallbackModelConfig.imageModel); }}>恢复原始默认值</button></div>
+              <label><span>API Base URL</span><div className="service-input"><Webhook size={15} /><input aria-label="API Base URL" value={baseUrlInput} onChange={(event) => setBaseUrlInput(event.target.value)} placeholder={fallbackModelConfig.baseUrl} /></div></label>
+              <div className="provider-model-grid">
+                <label><span>基础模型名称</span><div className="service-input"><Bot size={15} /><input aria-label="基础模型名称" value={chatModelInput} onChange={(event) => setChatModelInput(event.target.value)} placeholder={fallbackModelConfig.chatModel} /></div></label>
+                <label><span>图像模型名称</span><div className="service-input warm"><ImageIcon size={15} /><input aria-label="图像模型名称" value={imageModelInput} onChange={(event) => setImageModelInput(event.target.value)} placeholder={fallbackModelConfig.imageModel} /></div></label>
+              </div>
+            </div>
             <div className="connection-list">
               <article><span className="connection-icon"><Bot size={18} /></span><div><strong>基础模型</strong><small>{config?.defaultChatModel || 'gpt-5.4-mini'}</small></div><b className={config?.chatConfigured ? 'connected' : ''}>{config?.chatConfigured ? '已连接' : '未配置'}</b></article>
               <article><span className="connection-icon warm"><ImageIcon size={18} /></span><div><strong>GPT Image 2</strong><small>{config?.imageModel || 'gpt-image-2'}</small></div><b className={config?.imageConfigured ? 'connected' : ''}>{config?.imageConfigured ? '已连接' : '未配置'}</b></article>
@@ -1235,7 +1303,7 @@ function App() {
               </label>
             </div>
             {configMessage && <div className={`config-message ${configMessage.kind}`}>{configMessage.kind === 'success' && <Check size={14} />}{configMessage.text}</div>}
-            <div className="security-note"><KeyRound size={17} /><p><strong>Key 仅保存在当前浏览器 localStorage</strong><span>服务端不持久化完整 Key；模型调用时 Key 仅随本次请求发送。清理浏览器站点数据会同时删除配置。</span></p></div>
+            <div className="security-note"><KeyRound size={17} /><p><strong>连接参数与 Key 仅保存在当前浏览器 localStorage</strong><span>服务端不持久化完整配置；模型调用时配置仅随本次请求发送。清理浏览器站点数据会同时删除配置。</span></p></div>
           </div>
           <footer><button className="ghost-button" onClick={closeSettings} disabled={configSaving}>关闭</button><button className="publish-button" onClick={saveApiKeys} disabled={configSaving}>{configSaving ? <LoaderCircle className="spin" size={15} /> : <KeyRound size={15} />}{configSaving ? '保存中' : '保存配置'}</button></footer>
         </section>

@@ -22,6 +22,24 @@ const requestApiKey = (req) => {
   const value = req.get('x-aiflow-api-key');
   return typeof value === 'string' && value.length <= 4096 ? value.trim() : '';
 };
+const privateHostname = (hostname) => {
+  const value = hostname.toLowerCase();
+  return value === 'localhost' || value === '0.0.0.0' || value === '::1' || value.startsWith('127.') || value.startsWith('10.') || value.startsWith('192.168.') || /^172\.(1[6-9]|2\d|3[01])\./.test(value) || value === '169.254.169.254';
+};
+const requestBaseUrl = (value) => {
+  if (value === undefined || value === null || value === '') return baseUrl;
+  if (typeof value !== 'string' || value.length > 2048) throw new Error('Base URL 格式无效');
+  let target;
+  try { target = new URL(value.trim()); } catch { throw new Error('Base URL 必须是合法的 HTTP(S) 地址'); }
+  if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password) throw new Error('Base URL 仅支持不含账号密码的 HTTP(S) 地址');
+  if (privateHostname(target.hostname) && String(process.env.ALLOW_PRIVATE_MODEL_BASE_URL).toLowerCase() !== 'true') throw new Error('Base URL 不能指向本机或私有网络地址');
+  return target.toString().replace(/\/$/, '');
+};
+const requestModel = (value, fallback) => {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value !== 'string' || !value.trim() || value.length > 200) throw new Error('模型名称不能为空且不能超过 200 个字符');
+  return value.trim();
+};
 const publicConfig = () => ({
   baseUrl,
   chatConfigured: false,
@@ -48,20 +66,29 @@ app.post('/api/chat', async (req, res) => {
     return res.status(503).json({ code: 'CHAT_KEY_MISSING', message: '基础模型 Key 未配置', requestId: id });
   }
 
-  const { prompt, system, model, temperature = 0.7 } = req.body ?? {};
+  const { prompt, system, model, baseUrl: customBaseUrl, temperature = 0.7 } = req.body ?? {};
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ code: 'PROMPT_REQUIRED', message: '请输入提示词', requestId: id });
   }
 
+  let upstreamBaseUrl;
+  let upstreamModel;
   try {
-    const response = await fetch(`${baseUrl}/chat/completions`, {
+    upstreamBaseUrl = requestBaseUrl(customBaseUrl);
+    upstreamModel = requestModel(model, defaultChatModel);
+  } catch (error) {
+    return res.status(400).json({ code: 'MODEL_CONFIG_INVALID', message: safeError(error), requestId: id });
+  }
+
+  try {
+    const response = await fetch(`${upstreamBaseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${chatApiKey}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: model || defaultChatModel,
+        model: upstreamModel,
         messages: [
           ...(system ? [{ role: 'system', content: String(system) }] : []),
           { role: 'user', content: prompt }
@@ -81,7 +108,7 @@ app.post('/api/chat', async (req, res) => {
     return res.json({
       text: data?.choices?.[0]?.message?.content ?? '',
       usage: data?.usage ?? null,
-      model: data?.model || model || defaultChatModel,
+      model: data?.model || upstreamModel,
       requestId: id
     });
   } catch (error) {
@@ -95,7 +122,7 @@ app.post('/api/images', async (req, res) => {
   if (!imageApiKey) {
     return res.status(503).json({ code: 'IMAGE_KEY_MISSING', message: '图像模型 Key 未配置', requestId: id });
   }
-  const { prompt, size = '1024x1024', quality = 'high', count = 1, referenceImage = null } = req.body ?? {};
+  const { prompt, size = '1024x1024', quality = 'high', count = 1, referenceImage = null, baseUrl: customBaseUrl, model } = req.body ?? {};
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ code: 'PROMPT_REQUIRED', message: '请输入图像提示词', requestId: id });
   }
@@ -105,6 +132,15 @@ app.post('/api/images', async (req, res) => {
   }
   if (referenceImage !== null && (typeof referenceImage !== 'object' || typeof referenceImage.dataUrl !== 'string')) {
     return res.status(400).json({ code: 'INVALID_REFERENCE_IMAGE', message: '参考图片格式无效', requestId: id });
+  }
+
+  let upstreamBaseUrl;
+  let upstreamModel;
+  try {
+    upstreamBaseUrl = requestBaseUrl(customBaseUrl);
+    upstreamModel = requestModel(model, imageModel);
+  } catch (error) {
+    return res.status(400).json({ code: 'MODEL_CONFIG_INVALID', message: safeError(error), requestId: id });
   }
 
   let imageInput = null;
@@ -132,25 +168,25 @@ app.post('/api/images', async (req, res) => {
       attempts = attempt;
       if (imageInput) {
         const form = new FormData();
-        form.append('model', imageModel);
+        form.append('model', upstreamModel);
         form.append('prompt', prompt);
         form.append('size', size);
         form.append('quality', quality);
         form.append('n', String(imageCount));
         form.append('image', imageInput.blob, imageInput.filename);
-        response = await fetch(`${baseUrl}/images/edits`, {
+        response = await fetch(`${upstreamBaseUrl}/images/edits`, {
           method: 'POST',
           headers: { Authorization: `Bearer ${imageApiKey}` },
           body: form
         });
       } else {
-        response = await fetch(`${baseUrl}/images/generations`, {
+        response = await fetch(`${upstreamBaseUrl}/images/generations`, {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${imageApiKey}`,
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({ model: imageModel, prompt, size, quality, n: imageCount })
+          body: JSON.stringify({ model: upstreamModel, prompt, size, quality, n: imageCount })
         });
       }
       data = await response.json().catch(() => ({}));
@@ -172,7 +208,7 @@ app.post('/api/images', async (req, res) => {
         return res.json({
           ...images[0],
           images,
-          model: imageModel,
+          model: upstreamModel,
           mode: imageInput ? 'edit' : 'generate',
           simulated: true,
           attempts,
@@ -199,7 +235,7 @@ app.post('/api/images', async (req, res) => {
       revisedPrompt: first.revisedPrompt ?? null,
       images,
       count: images.length,
-      model: imageModel,
+      model: upstreamModel,
       mode: imageInput ? 'edit' : 'generate',
       simulated: false,
       attempts,
@@ -227,9 +263,7 @@ app.post('/api/http', async (req, res) => {
   if (!['http:', 'https:'].includes(target.protocol)) {
     return res.status(400).json({ code: 'HTTP_PROTOCOL_INVALID', message: 'HTTP 节点仅允许 http:// 或 https://', requestId: id });
   }
-  const hostname = target.hostname.toLowerCase();
-  const privateAddress = hostname === 'localhost' || hostname === '0.0.0.0' || hostname === '::1' || hostname.startsWith('127.') || hostname.startsWith('10.') || hostname.startsWith('192.168.') || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) || hostname === '169.254.169.254';
-  if (privateAddress) {
+  if (privateHostname(target.hostname)) {
     return res.status(403).json({ code: 'HTTP_PRIVATE_ADDRESS_BLOCKED', message: '为保护本机安全，HTTP 节点不能访问本地或私有网络地址', requestId: id });
   }
 

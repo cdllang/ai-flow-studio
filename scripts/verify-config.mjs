@@ -1,4 +1,9 @@
 import { chromium } from 'playwright-core';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const screenshotDir = path.resolve('.verification');
+fs.mkdirSync(screenshotDir, { recursive: true });
 
 const browser = await chromium.launch({
   headless: true,
@@ -18,17 +23,38 @@ const configDialog = page.getByRole('dialog', { name: '模型配置' });
 if (!await configDialog.isVisible()) await page.getByRole('button', { name: '模型配置', exact: true }).click();
 await configDialog.waitFor();
 await page.waitForTimeout(250);
-await page.screenshot({ path: 'config-modal.png', fullPage: true });
+const baseUrlInput = page.getByRole('textbox', { name: 'API Base URL' });
+const chatModelInput = page.getByRole('textbox', { name: '基础模型名称' });
+const imageModelInput = page.getByRole('textbox', { name: '图像模型名称' });
+const defaultsVisible = {
+  baseUrl: await baseUrlInput.inputValue(),
+  chatModel: await chatModelInput.inputValue(),
+  imageModel: await imageModelInput.inputValue()
+};
+await baseUrlInput.fill('https://gateway.example.com/openai/v1/');
+await chatModelInput.fill('merchant-chat-v2');
+await imageModelInput.fill('merchant-image-v3');
+await page.screenshot({ path: path.join(screenshotDir, 'config-modal.png'), fullPage: true });
 
 const keyInputs = page.locator('.secret-input input');
 await keyInputs.nth(0).fill('test-chat-key');
 await keyInputs.nth(1).fill('test-image-key');
 await page.getByRole('button', { name: '保存配置' }).click();
-await page.getByText('API Key 已保存到当前浏览器并立即生效').waitFor();
+await page.getByText('连接参数与 API Key 已保存到当前浏览器并立即生效').waitFor();
 const storedAfterSave = await page.evaluate(() => {
   const value = JSON.parse(localStorage.getItem('aiflow.demo.apiKeys') || '{}');
-  return Boolean(value.chatApiKey) && Boolean(value.imageApiKey);
+  return Boolean(value.chatApiKey) && Boolean(value.imageApiKey)
+    && value.baseUrl === 'https://gateway.example.com/openai/v1'
+    && value.chatModel === 'merchant-chat-v2'
+    && value.imageModel === 'merchant-image-v3';
 });
+const nodeModelsUpdated = await page.locator('.flow-node').filter({ hasText: 'merchant-chat-v2' }).count() > 0
+  && await page.locator('.flow-node').filter({ hasText: 'merchant-image-v3' }).count() > 0;
+
+await page.getByRole('button', { name: '恢复原始默认值' }).click();
+const defaultsRestored = await baseUrlInput.inputValue() === 'https://ai.aiwanai.com.cn/v1'
+  && await chatModelInput.inputValue() === 'gpt-5.4-mini'
+  && await imageModelInput.inputValue() === 'gpt-image-2-count';
 
 await page.getByRole('button', { name: '清除已保存 Key' }).nth(0).click();
 await page.getByRole('button', { name: '清除已保存 Key' }).nth(0).click();
@@ -40,11 +66,14 @@ const clearedAfterTest = await page.evaluate(() => {
   return !value.chatApiKey && !value.imageApiKey;
 });
 const result = {
-  baseVisible: await page.getByText('https://ai.aiwanai.com.cn/v1').count() > 0,
-  chatModelVisible: await page.getByText('gpt-5.4-mini').count() > 0,
-  imageModelVisible: await page.getByText('gpt-image-2-count').count() > 0,
+  baseVisible: defaultsVisible.baseUrl === 'https://ai.aiwanai.com.cn/v1',
+  chatModelVisible: defaultsVisible.chatModel === 'gpt-5.4-mini',
+  imageModelVisible: defaultsVisible.imageModel === 'gpt-image-2-count',
   keyInputs: await keyInputs.count(),
+  defaultsVisible,
+  defaultsRestored,
   storedAfterSave,
+  nodeModelsUpdated,
   clearedAfterTest,
   serverCredentialStorage: status.credentialStorage,
   plainKeysReturned: Object.hasOwn(status, 'chatApiKey') || Object.hasOwn(status, 'imageApiKey'),
