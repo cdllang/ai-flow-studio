@@ -9,24 +9,31 @@ import {
 
 test('model connection config keeps existing defaults for legacy localStorage', () => {
   assert.deepEqual(normalizeModelConnectionConfig({}), fallbackModelConfig);
-  assert.deepEqual(normalizeModelConnectionConfig({ baseUrl: '', chatModel: '', imageModel: '' }), fallbackModelConfig);
+  assert.deepEqual(normalizeModelConnectionConfig({ chatBaseUrl: '', imageBaseUrl: '', chatModel: '', imageModel: '' }), fallbackModelConfig);
+  assert.deepEqual(normalizeModelConnectionConfig({ baseUrl: 'https://legacy.example.com/v1' }), {
+    ...fallbackModelConfig,
+    chatBaseUrl: 'https://legacy.example.com/v1',
+    imageBaseUrl: 'https://legacy.example.com/v1'
+  });
 });
 
 test('model connection config trims custom values and trailing slash', () => {
   assert.deepEqual(normalizeModelConnectionConfig({
-    baseUrl: ' https://gateway.example.com/v1/ ',
+    chatBaseUrl: ' https://chat.example.com/v1/ ',
+    imageBaseUrl: ' https://image.example.com/openai/ ',
     chatModel: ' custom-chat ',
     imageModel: ' custom-image '
   }), {
-    baseUrl: 'https://gateway.example.com/v1',
+    chatBaseUrl: 'https://chat.example.com/v1',
+    imageBaseUrl: 'https://image.example.com/openai',
     chatModel: 'custom-chat',
     imageModel: 'custom-image'
   });
 });
 
 test('model connection config rejects unsafe or incomplete values', () => {
-  assert.match(validateModelConnectionConfig({ ...fallbackModelConfig, baseUrl: 'file:///tmp/model' }) || '', /HTTP/);
-  assert.match(validateModelConnectionConfig({ ...fallbackModelConfig, baseUrl: 'https://user:pass@example.com/v1' }) || '', /账号密码/);
+  assert.match(validateModelConnectionConfig({ ...fallbackModelConfig, chatBaseUrl: 'file:///tmp/model' }) || '', /基础模型.*HTTP/);
+  assert.match(validateModelConnectionConfig({ ...fallbackModelConfig, imageBaseUrl: 'https://user:pass@example.com/v1' }) || '', /图像模型.*账号密码/);
   assert.match(validateModelConnectionConfig({ ...fallbackModelConfig, chatModel: '' }) || '', /基础模型/);
   assert.equal(validateModelConnectionConfig({ ...fallbackModelConfig }), null);
 });

@@ -23,15 +23,18 @@ const configDialog = page.getByRole('dialog', { name: '模型配置' });
 if (!await configDialog.isVisible()) await page.getByRole('button', { name: '模型配置', exact: true }).click();
 await configDialog.waitFor();
 await page.waitForTimeout(250);
-const baseUrlInput = page.getByRole('textbox', { name: 'API Base URL' });
+const chatBaseUrlInput = page.getByRole('textbox', { name: '基础模型 Base URL' });
+const imageBaseUrlInput = page.getByRole('textbox', { name: '图像模型 Base URL' });
 const chatModelInput = page.getByRole('textbox', { name: '基础模型名称' });
 const imageModelInput = page.getByRole('textbox', { name: '图像模型名称' });
 const defaultsVisible = {
-  baseUrl: await baseUrlInput.inputValue(),
+  chatBaseUrl: await chatBaseUrlInput.inputValue(),
+  imageBaseUrl: await imageBaseUrlInput.inputValue(),
   chatModel: await chatModelInput.inputValue(),
   imageModel: await imageModelInput.inputValue()
 };
-await baseUrlInput.fill('https://gateway.example.com/openai/v1/');
+await chatBaseUrlInput.fill('https://chat.example.com/openai/v1/');
+await imageBaseUrlInput.fill('https://image.example.com/openai/v1/');
 await chatModelInput.fill('merchant-chat-v2');
 await imageModelInput.fill('merchant-image-v3');
 await page.screenshot({ path: path.join(screenshotDir, 'config-modal.png'), fullPage: true });
@@ -44,7 +47,9 @@ await page.getByText('连接参数与 API Key 已保存到当前浏览器并立�
 const storedAfterSave = await page.evaluate(() => {
   const value = JSON.parse(localStorage.getItem('aiflow.demo.apiKeys') || '{}');
   return Boolean(value.chatApiKey) && Boolean(value.imageApiKey)
-    && value.baseUrl === 'https://gateway.example.com/openai/v1'
+    && value.chatBaseUrl === 'https://chat.example.com/openai/v1'
+    && value.imageBaseUrl === 'https://image.example.com/openai/v1'
+    && !Object.hasOwn(value, 'baseUrl')
     && value.chatModel === 'merchant-chat-v2'
     && value.imageModel === 'merchant-image-v3';
 });
@@ -52,7 +57,8 @@ const nodeModelsUpdated = await page.locator('.flow-node').filter({ hasText: 'me
   && await page.locator('.flow-node').filter({ hasText: 'merchant-image-v3' }).count() > 0;
 
 await page.getByRole('button', { name: '恢复原始默认值' }).click();
-const defaultsRestored = await baseUrlInput.inputValue() === 'https://ai.aiwanai.com.cn/v1'
+const defaultsRestored = await chatBaseUrlInput.inputValue() === 'https://ai.aiwanai.com.cn/v1'
+  && await imageBaseUrlInput.inputValue() === 'https://ai.aiwanai.com.cn/v1'
   && await chatModelInput.inputValue() === 'gpt-5.4-mini'
   && await imageModelInput.inputValue() === 'gpt-image-2-count';
 
@@ -66,7 +72,8 @@ const clearedAfterTest = await page.evaluate(() => {
   return !value.chatApiKey && !value.imageApiKey;
 });
 const result = {
-  baseVisible: defaultsVisible.baseUrl === 'https://ai.aiwanai.com.cn/v1',
+  chatBaseVisible: defaultsVisible.chatBaseUrl === 'https://ai.aiwanai.com.cn/v1',
+  imageBaseVisible: defaultsVisible.imageBaseUrl === 'https://ai.aiwanai.com.cn/v1',
   chatModelVisible: defaultsVisible.chatModel === 'gpt-5.4-mini',
   imageModelVisible: defaultsVisible.imageModel === 'gpt-image-2-count',
   keyInputs: await keyInputs.count(),

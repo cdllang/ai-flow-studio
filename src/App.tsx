@@ -106,7 +106,9 @@ type FlowData = Record<string, unknown> & {
 };
 
 type ApiStatus = {
-  baseUrl: string;
+  baseUrl?: string;
+  chatBaseUrl: string;
+  imageBaseUrl: string;
   chatConfigured: boolean;
   imageConfigured: boolean;
   chatKeyHint: string | null;
@@ -289,19 +291,21 @@ function loadStoredApiKeys(): StoredApiKeys {
     return {
       chatApiKey: typeof value.chatApiKey === 'string' ? value.chatApiKey : '',
       imageApiKey: typeof value.imageApiKey === 'string' ? value.imageApiKey : '',
-      baseUrl: typeof value.baseUrl === 'string' ? value.baseUrl : '',
+      chatBaseUrl: typeof value.chatBaseUrl === 'string' ? value.chatBaseUrl : typeof value.baseUrl === 'string' ? value.baseUrl : '',
+      imageBaseUrl: typeof value.imageBaseUrl === 'string' ? value.imageBaseUrl : typeof value.baseUrl === 'string' ? value.baseUrl : '',
       chatModel: typeof value.chatModel === 'string' ? value.chatModel : '',
       imageModel: typeof value.imageModel === 'string' ? value.imageModel : ''
     };
   } catch {
-    return { chatApiKey: '', imageApiKey: '', baseUrl: '', chatModel: '', imageModel: '' };
+    return { chatApiKey: '', imageApiKey: '', chatBaseUrl: '', imageBaseUrl: '', chatModel: '', imageModel: '' };
   }
 }
 
 function statusWithLocalKeys(status: ApiStatus, keys: StoredApiKeys): ApiStatus {
   return {
     ...status,
-    baseUrl: keys.baseUrl || status.baseUrl,
+    chatBaseUrl: keys.chatBaseUrl || status.chatBaseUrl || status.baseUrl || fallbackModelConfig.chatBaseUrl,
+    imageBaseUrl: keys.imageBaseUrl || status.imageBaseUrl || status.baseUrl || fallbackModelConfig.imageBaseUrl,
     defaultChatModel: keys.chatModel || status.defaultChatModel,
     imageModel: keys.imageModel || status.imageModel,
     chatConfigured: Boolean(keys.chatApiKey),
@@ -448,7 +452,8 @@ function App() {
   const [draggingImage, setDraggingImage] = useState(false);
   const [apiKeys, setApiKeys] = useState<StoredApiKeys>(loadStoredApiKeys);
   const [config, setConfig] = useState<ApiStatus | null>(null);
-  const [baseUrlInput, setBaseUrlInput] = useState('');
+  const [chatBaseUrlInput, setChatBaseUrlInput] = useState('');
+  const [imageBaseUrlInput, setImageBaseUrlInput] = useState('');
   const [chatModelInput, setChatModelInput] = useState('');
   const [imageModelInput, setImageModelInput] = useState('');
   const [chatApiKey, setChatApiKey] = useState('');
@@ -470,7 +475,8 @@ function App() {
       .then((response) => response.json())
       .then((status: ApiStatus) => {
         const resolvedConnection = normalizeModelConnectionConfig(apiKeys, {
-          baseUrl: status.baseUrl,
+          chatBaseUrl: status.chatBaseUrl || status.baseUrl || fallbackModelConfig.chatBaseUrl,
+          imageBaseUrl: status.imageBaseUrl || status.baseUrl || fallbackModelConfig.imageBaseUrl,
           chatModel: status.defaultChatModel,
           imageModel: status.imageModel
         });
@@ -478,7 +484,8 @@ function App() {
         const localStatus = statusWithLocalKeys(status, resolvedKeys);
         setApiKeys(resolvedKeys);
         setConfig(localStatus);
-        setBaseUrlInput(localStatus.baseUrl);
+        setChatBaseUrlInput(localStatus.chatBaseUrl);
+        setImageBaseUrlInput(localStatus.imageBaseUrl);
         setChatModelInput(localStatus.defaultChatModel);
         setImageModelInput(localStatus.imageModel);
         if (!localStatus.chatConfigured || !localStatus.imageConfigured) {
@@ -567,7 +574,8 @@ function App() {
   };
 
   const openSettings = () => {
-    setBaseUrlInput(config?.baseUrl || apiKeys.baseUrl || fallbackModelConfig.baseUrl);
+    setChatBaseUrlInput(config?.chatBaseUrl || apiKeys.chatBaseUrl || fallbackModelConfig.chatBaseUrl);
+    setImageBaseUrlInput(config?.imageBaseUrl || apiKeys.imageBaseUrl || fallbackModelConfig.imageBaseUrl);
     setChatModelInput(config?.defaultChatModel || apiKeys.chatModel || fallbackModelConfig.chatModel);
     setImageModelInput(config?.imageModel || apiKeys.imageModel || fallbackModelConfig.imageModel);
     setChatApiKey('');
@@ -591,11 +599,13 @@ function App() {
     setConfigMessage(null);
     try {
       const connection = normalizeModelConnectionConfig({
-        baseUrl: baseUrlInput,
+        chatBaseUrl: chatBaseUrlInput,
+        imageBaseUrl: imageBaseUrlInput,
         chatModel: chatModelInput,
         imageModel: imageModelInput
       }, {
-        baseUrl: config?.baseUrl || fallbackModelConfig.baseUrl,
+        chatBaseUrl: config?.chatBaseUrl || fallbackModelConfig.chatBaseUrl,
+        imageBaseUrl: config?.imageBaseUrl || fallbackModelConfig.imageBaseUrl,
         chatModel: config?.defaultChatModel || fallbackModelConfig.chatModel,
         imageModel: config?.imageModel || fallbackModelConfig.imageModel
       });
@@ -609,7 +619,8 @@ function App() {
       localStorage.setItem(apiKeysStorageKey, JSON.stringify(nextKeys));
       setApiKeys(nextKeys);
       setConfig((current) => statusWithLocalKeys(current || {
-        baseUrl: fallbackModelConfig.baseUrl,
+        chatBaseUrl: fallbackModelConfig.chatBaseUrl,
+        imageBaseUrl: fallbackModelConfig.imageBaseUrl,
         chatConfigured: false,
         imageConfigured: false,
         chatKeyHint: null,
@@ -899,7 +910,7 @@ function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': apiKeys.chatApiKey },
             signal: controller.signal,
-            body: JSON.stringify({ prompt: upstreamText, system: node.data.prompt, baseUrl: apiKeys.baseUrl, model: node.data.model || apiKeys.chatModel })
+            body: JSON.stringify({ prompt: upstreamText, system: node.data.prompt, baseUrl: apiKeys.chatBaseUrl, model: node.data.model || apiKeys.chatModel })
           });
           const data = await response.json();
           if (!response.ok) throw new Error(data.message || '基础模型调用失败');
@@ -910,7 +921,7 @@ function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': apiKeys.imageApiKey },
             signal: controller.signal,
-            body: JSON.stringify({ prompt: upstreamText, size: node.data.imageSize || '1024x1024', quality: node.data.imageQuality || 'high', count: node.data.imageCount || 1, referenceImage, baseUrl: apiKeys.baseUrl, model: node.data.model || apiKeys.imageModel })
+            body: JSON.stringify({ prompt: upstreamText, size: node.data.imageSize || '1024x1024', quality: node.data.imageQuality || 'high', count: node.data.imageCount || 1, referenceImage, baseUrl: apiKeys.imageBaseUrl, model: node.data.model || apiKeys.imageModel })
           });
           const data = await response.json();
           if (!response.ok) throw new Error(data.message || '图像模型调用失败');
@@ -1279,16 +1290,19 @@ function App() {
           <header><div><span className="modal-icon"><Settings size={18} /></span><div><strong>模型服务配置</strong><small>{config?.chatConfigured && config?.imageConfigured ? 'OpenAI 兼容网关' : '首次使用需要完成 API Key 配置'}</small></div></div><button className="icon-button" onClick={closeSettings} aria-label="关闭模型配置"><X size={18} /></button></header>
           <div className="settings-body">
             <div className="provider-fields">
-              <div className="provider-fields-head"><div><strong>连接参数</strong><small>默认沿用原网关与模型，可按服务商配置修改</small></div><button type="button" onClick={() => { setBaseUrlInput(fallbackModelConfig.baseUrl); setChatModelInput(fallbackModelConfig.chatModel); setImageModelInput(fallbackModelConfig.imageModel); }}>恢复原始默认值</button></div>
-              <label><span>API Base URL</span><div className="service-input"><Webhook size={15} /><input aria-label="API Base URL" value={baseUrlInput} onChange={(event) => setBaseUrlInput(event.target.value)} placeholder={fallbackModelConfig.baseUrl} /></div></label>
-              <div className="provider-model-grid">
-                <label><span>基础模型名称</span><div className="service-input"><Bot size={15} /><input aria-label="基础模型名称" value={chatModelInput} onChange={(event) => setChatModelInput(event.target.value)} placeholder={fallbackModelConfig.chatModel} /></div></label>
-                <label><span>图像模型名称</span><div className="service-input warm"><ImageIcon size={15} /><input aria-label="图像模型名称" value={imageModelInput} onChange={(event) => setImageModelInput(event.target.value)} placeholder={fallbackModelConfig.imageModel} /></div></label>
+              <div className="provider-fields-head"><div><strong>供应商连接参数</strong><small>基础模型与图像模型可分别接入不同的 OpenAI 兼容服务</small></div><button type="button" onClick={() => { setChatBaseUrlInput(fallbackModelConfig.chatBaseUrl); setImageBaseUrlInput(fallbackModelConfig.imageBaseUrl); setChatModelInput(fallbackModelConfig.chatModel); setImageModelInput(fallbackModelConfig.imageModel); }}>恢复原始默认值</button></div>
+              <div className="provider-supplier-grid">
+                <article className="provider-supplier-card">
+                  <div className="supplier-title"><span className="connection-icon"><Bot size={18} /></span><div><strong>基础模型供应商</strong><small>POST /chat/completions</small></div><b className={config?.chatConfigured ? 'connected' : ''}>{config?.chatConfigured ? '已连接' : '未配置'}</b></div>
+                  <label><span>基础模型 Base URL</span><div className="service-input"><Webhook size={15} /><input aria-label="基础模型 Base URL" value={chatBaseUrlInput} onChange={(event) => setChatBaseUrlInput(event.target.value)} placeholder={fallbackModelConfig.chatBaseUrl} /></div></label>
+                  <label><span>基础模型名称</span><div className="service-input"><Bot size={15} /><input aria-label="基础模型名称" value={chatModelInput} onChange={(event) => setChatModelInput(event.target.value)} placeholder={fallbackModelConfig.chatModel} /></div></label>
+                </article>
+                <article className="provider-supplier-card warm">
+                  <div className="supplier-title"><span className="connection-icon warm"><ImageIcon size={18} /></span><div><strong>图像模型供应商</strong><small>POST /images/generations</small></div><b className={config?.imageConfigured ? 'connected' : ''}>{config?.imageConfigured ? '已连接' : '未配置'}</b></div>
+                  <label><span>图像模型 Base URL</span><div className="service-input warm"><Webhook size={15} /><input aria-label="图像模型 Base URL" value={imageBaseUrlInput} onChange={(event) => setImageBaseUrlInput(event.target.value)} placeholder={fallbackModelConfig.imageBaseUrl} /></div></label>
+                  <label><span>图像模型名称</span><div className="service-input warm"><ImageIcon size={15} /><input aria-label="图像模型名称" value={imageModelInput} onChange={(event) => setImageModelInput(event.target.value)} placeholder={fallbackModelConfig.imageModel} /></div></label>
+                </article>
               </div>
-            </div>
-            <div className="connection-list">
-              <article><span className="connection-icon"><Bot size={18} /></span><div><strong>基础模型</strong><small>{config?.defaultChatModel || 'gpt-5.4-mini'}</small></div><b className={config?.chatConfigured ? 'connected' : ''}>{config?.chatConfigured ? '已连接' : '未配置'}</b></article>
-              <article><span className="connection-icon warm"><ImageIcon size={18} /></span><div><strong>GPT Image 2</strong><small>{config?.imageModel || 'gpt-image-2'}</small></div><b className={config?.imageConfigured ? 'connected' : ''}>{config?.imageConfigured ? '已连接' : '未配置'}</b></article>
             </div>
             <div className="key-fields">
               <label className={clearChatKey ? 'is-clearing' : ''}>

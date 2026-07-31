@@ -406,7 +406,16 @@ button svg { flex: 0 0 auto; }
 .provider-fields-head button:hover { color: var(--soft); border-color: var(--line-strong); }
 .provider-fields label { display: grid; gap: 6px; }
 .provider-fields label > span { color: var(--muted); font-size: 8px; font-weight: 900; }
-.provider-model-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.provider-supplier-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+.provider-supplier-card { display: grid; min-width: 0; padding: 12px; gap: 11px; background: rgba(86,136,255,.035); border: 1px solid rgba(86,136,255,.14); border-radius: var(--radius); }
+.provider-supplier-card.warm { background: rgba(255,138,61,.035); border-color: rgba(255,138,61,.14); }
+.supplier-title { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.supplier-title > div { min-width: 0; flex: 1; }
+.supplier-title strong, .supplier-title small { display: block; }
+.supplier-title strong { color: var(--soft); font-size: 10px; }
+.supplier-title small { margin-top: 4px; color: var(--muted); font: 500 8px/1.3 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.supplier-title b { color: var(--red); font-size: 8px; white-space: nowrap; }
+.supplier-title b.connected { color: var(--green); }
 .service-input { display: flex; min-height: 39px; align-items: center; padding: 0 10px; gap: 8px; color: var(--blue); background: #11100e; border: 1px solid var(--line); border-radius: 7px; transition: border-color .16s ease; }
 .service-input.warm { color: var(--orange); }
 .service-input:focus-within { border-color: rgba(86,136,255,.48); }
@@ -448,7 +457,8 @@ button svg { flex: 0 0 auto; }
 .security-note span { margin-top: 5px; font-size: 9px; line-height: 1.55; }
 .settings-modal footer { justify-content: flex-end; min-height: 64px; padding: 0 20px; gap: 8px; border-top: 1px solid var(--line); }
 .settings-modal footer button { min-width: 82px; }
-@media (max-width: 620px) { .provider-model-grid { grid-template-columns: 1fr; } .provider-fields-head { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 760px) { .provider-supplier-grid { grid-template-columns: 1fr; } }
+@media (max-width: 620px) { .provider-fields-head { align-items: flex-start; flex-direction: column; } }
 .preset-dialog { width: min(1020px, 100%); max-height: calc(100vh - 48px); overflow: hidden; background: var(--panel); border: 1px solid var(--line-strong); border-radius: 12px; box-shadow: 0 30px 80px rgba(0,0,0,.55); animation: modal-in .18s ease both; }
 .preset-dialog > header { display: flex; min-height: 70px; align-items: center; justify-content: space-between; padding: 0 20px; border-bottom: 1px solid var(--line); }
 .preset-dialog > header > div { display: flex; align-items: center; gap: 10px; }

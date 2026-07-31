@@ -12,6 +12,8 @@ services:
       HOST: 0.0.0.0
       PORT: 14590
       AIWANAI_BASE_URL: https://ai.aiwanai.com.cn/v1
+      AIWANAI_CHAT_BASE_URL: https://ai.aiwanai.com.cn/v1
+      AIWANAI_IMAGE_BASE_URL: https://ai.aiwanai.com.cn/v1
       AIWANAI_DEFAULT_CHAT_MODEL: gpt-5.4-mini
       AIWANAI_IMAGE_MODEL: gpt-image-2-count
       IMAGE_DEMO_FALLBACK: "false"

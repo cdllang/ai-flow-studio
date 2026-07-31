@@ -11,6 +11,8 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const port = Number(process.env.PORT || 14590);
 const host = process.env.HOST || '0.0.0.0';
 const baseUrl = (process.env.AIWANAI_BASE_URL || 'https://ai.aiwanai.com.cn/v1').replace(/\/$/, '');
+const chatBaseUrl = (process.env.AIWANAI_CHAT_BASE_URL || baseUrl).replace(/\/$/, '');
+const imageBaseUrl = (process.env.AIWANAI_IMAGE_BASE_URL || baseUrl).replace(/\/$/, '');
 const defaultChatModel = process.env.AIWANAI_DEFAULT_CHAT_MODEL || 'gpt-5.4-mini';
 const imageModel = process.env.AIWANAI_IMAGE_MODEL || 'gpt-image-2';
 const safeError = (error) => error instanceof Error ? error.message : 'Unknown upstream error';
@@ -26,8 +28,8 @@ const privateHostname = (hostname) => {
   const value = hostname.toLowerCase();
   return value === 'localhost' || value === '0.0.0.0' || value === '::1' || value.startsWith('127.') || value.startsWith('10.') || value.startsWith('192.168.') || /^172\.(1[6-9]|2\d|3[01])\./.test(value) || value === '169.254.169.254';
 };
-const requestBaseUrl = (value) => {
-  if (value === undefined || value === null || value === '') return baseUrl;
+const requestBaseUrl = (value, fallback) => {
+  if (value === undefined || value === null || value === '') return fallback;
   if (typeof value !== 'string' || value.length > 2048) throw new Error('Base URL 格式无效');
   let target;
   try { target = new URL(value.trim()); } catch { throw new Error('Base URL 必须是合法的 HTTP(S) 地址'); }
@@ -42,6 +44,8 @@ const requestModel = (value, fallback) => {
 };
 const publicConfig = () => ({
   baseUrl,
+  chatBaseUrl,
+  imageBaseUrl,
   chatConfigured: false,
   imageConfigured: false,
   chatKeyHint: null,
@@ -74,7 +78,7 @@ app.post('/api/chat', async (req, res) => {
   let upstreamBaseUrl;
   let upstreamModel;
   try {
-    upstreamBaseUrl = requestBaseUrl(customBaseUrl);
+    upstreamBaseUrl = requestBaseUrl(customBaseUrl, chatBaseUrl);
     upstreamModel = requestModel(model, defaultChatModel);
   } catch (error) {
     return res.status(400).json({ code: 'MODEL_CONFIG_INVALID', message: safeError(error), requestId: id });
@@ -137,7 +141,7 @@ app.post('/api/images', async (req, res) => {
   let upstreamBaseUrl;
   let upstreamModel;
   try {
-    upstreamBaseUrl = requestBaseUrl(customBaseUrl);
+    upstreamBaseUrl = requestBaseUrl(customBaseUrl, imageBaseUrl);
     upstreamModel = requestModel(model, imageModel);
   } catch (error) {
     return res.status(400).json({ code: 'MODEL_CONFIG_INVALID', message: safeError(error), requestId: id });
