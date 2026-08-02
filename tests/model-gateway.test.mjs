@@ -74,6 +74,12 @@ test('gateway forwards chat and image requests to separate browser-selected supp
     const chatBaseUrl = `http://127.0.0.1:${chatUpstreamPort}/chat-provider/v1`;
     const imageBaseUrl = `http://127.0.0.1:${imageUpstreamPort}/image-provider/v1`;
 
+    const catalog = await fetch(`${origin}/api/skills`);
+    assert.equal(catalog.status, 200);
+    const catalogData = await catalog.json();
+    assert.deepEqual(catalogData.skills.map((skill) => skill.id), ['gpt-image-2']);
+    assert.equal(catalogData.skills[0].instructions, undefined);
+
     const chat = await fetch(`${origin}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': 'test-chat-key' },
@@ -89,7 +95,24 @@ test('gateway forwards chat and image requests to separate browser-selected supp
     const responses = await fetch(`${origin}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': 'test-chat-key' },
-      body: JSON.stringify({ prompt: 'reason about this', system: 'be precise', baseUrl: chatBaseUrl, model: 'merchant-reasoner-v1', protocol: 'responses' })
+      body: JSON.stringify({
+        prompt: 'reason about this',
+        system: 'be precise',
+        baseUrl: chatBaseUrl,
+        model: 'merchant-reasoner-v1',
+        protocol: 'responses',
+        skillIds: ['gpt-image-2'],
+        localSkills: [{
+          id: 'local-brand-visual',
+          name: '品牌视觉',
+          version: 'local-1',
+          description: '保持用户自己的品牌视觉规则',
+          category: 'custom',
+          mode: 'advisor',
+          nodeKinds: ['llm'],
+          instructions: 'Always use the local brand visual rules.'
+        }]
+      })
     });
     assert.equal(responses.status, 200);
     const responsesData = await responses.json();
@@ -98,6 +121,7 @@ test('gateway forwards chat and image requests to separate browser-selected supp
     assert.equal(responsesData.reasoningEffort, 'high');
     assert.equal(responsesData.text, 'custom responses ok');
     assert.equal(responsesData.usage.total_tokens, 9);
+    assert.deepEqual(responsesData.skills.map((skill) => [skill.id, skill.source]), [['gpt-image-2', 'server'], ['local-brand-visual', 'local']]);
 
     const image = await fetch(`${origin}/api/images`, {
       method: 'POST',
@@ -116,13 +140,26 @@ test('gateway forwards chat and image requests to separate browser-selected supp
     assert.equal(chatReceived[0].body.reasoning_effort, 'max');
     assert.equal(chatReceived[0].body.temperature, 0.7);
     assert.equal(chatReceived[1].body.input, 'reason about this');
-    assert.equal(chatReceived[1].body.instructions, 'be precise');
+    assert.match(chatReceived[1].body.instructions, /^be precise/);
+    assert.match(chatReceived[1].body.instructions, /<skill id="gpt-image-2" version="1\.0\.0" mode="advisor">/);
+    assert.match(chatReceived[1].body.instructions, /只负责生成或改写高质量图像提示词/);
+    assert.match(chatReceived[1].body.instructions, /<skill id="local-brand-visual" version="local-1" mode="advisor">/);
+    assert.match(chatReceived[1].body.instructions, /Always use the local brand visual rules/);
     assert.equal(chatReceived[1].body.messages, undefined);
     assert.deepEqual(chatReceived[1].body.reasoning, { effort: 'high' });
     assert.equal(chatReceived[1].body.temperature, undefined);
     assert.deepEqual(imageReceived.map((item) => [item.url, item.body.model]), [
       ['/image-provider/v1/images/generations', 'merchant-image-v3']
     ]);
+
+    const unknownSkill = await fetch(`${origin}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': 'test-chat-key' },
+      body: JSON.stringify({ prompt: 'hello', baseUrl: chatBaseUrl, model: 'chat', skillIds: ['missing-skill'] })
+    });
+    assert.equal(unknownSkill.status, 400);
+    assert.equal((await unknownSkill.json()).code, 'SKILL_CONFIG_INVALID');
+    assert.equal(chatReceived.length, 2);
 
     const invalid = await fetch(`${origin}/api/chat`, {
       method: 'POST',

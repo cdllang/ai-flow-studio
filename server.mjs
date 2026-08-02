@@ -3,11 +3,14 @@ import dotenv from 'dotenv';
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { composeSkillInstructions, listPublicSkills, loadSkillRegistry, resolveLocalSkills, resolveSkills } from './skill-registry.mjs';
 
 dotenv.config({ path: '.env.local', override: false });
 
 const app = express();
 const root = path.dirname(fileURLToPath(import.meta.url));
+const skillsDirectory = path.resolve(root, process.env.SKILLS_DIR || 'skills');
+const skillRegistry = loadSkillRegistry(skillsDirectory);
 const port = Number(process.env.PORT || 14590);
 const host = process.env.HOST || '0.0.0.0';
 const baseUrl = (process.env.AIWANAI_BASE_URL || 'https://ai.aiwanai.com.cn/v1').replace(/\/$/, '');
@@ -81,6 +84,10 @@ app.get('/api/config/status', (_req, res) => {
   res.set('Cache-Control', 'no-store').json(publicConfig());
 });
 
+app.get('/api/skills', (_req, res) => {
+  res.set('Cache-Control', 'no-store').json({ schemaVersion: 1, skills: listPublicSkills(skillRegistry) });
+});
+
 app.post('/api/chat', async (req, res) => {
   const id = requestId();
   const chatApiKey = requestApiKey(req);
@@ -88,7 +95,7 @@ app.post('/api/chat', async (req, res) => {
     return res.status(503).json({ code: 'CHAT_KEY_MISSING', message: '基础模型 Key 未配置', requestId: id });
   }
 
-  const { prompt, system, model, baseUrl: customBaseUrl, protocol, reasoningEffort, temperature } = req.body ?? {};
+  const { prompt, system, model, baseUrl: customBaseUrl, protocol, reasoningEffort, temperature, skillIds, localSkills } = req.body ?? {};
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ code: 'PROMPT_REQUIRED', message: '请输入提示词', requestId: id });
   }
@@ -97,6 +104,7 @@ app.post('/api/chat', async (req, res) => {
   let upstreamModel;
   let upstreamProtocol;
   let upstreamReasoningEffort;
+  let appliedSkills;
   try {
     upstreamBaseUrl = requestBaseUrl(customBaseUrl, chatBaseUrl);
     upstreamModel = requestModel(model, defaultChatModel);
@@ -105,6 +113,15 @@ app.post('/api/chat', async (req, res) => {
   } catch (error) {
     return res.status(400).json({ code: 'MODEL_CONFIG_INVALID', message: safeError(error), requestId: id });
   }
+  try {
+    const serverSkills = resolveSkills(skillIds, skillRegistry, 'llm');
+    const requestLocalSkills = resolveLocalSkills(localSkills, skillRegistry, 'llm');
+    appliedSkills = [...serverSkills, ...requestLocalSkills];
+    if (appliedSkills.length > 8) throw new Error('A node can apply at most 8 Skills');
+  } catch (error) {
+    return res.status(400).json({ code: 'SKILL_CONFIG_INVALID', message: safeError(error), requestId: id });
+  }
+  const upstreamSystem = composeSkillInstructions(system, appliedSkills);
 
   try {
     const response = await fetch(`${upstreamBaseUrl}/${upstreamProtocol === 'responses' ? 'responses' : 'chat/completions'}`, {
@@ -116,14 +133,14 @@ app.post('/api/chat', async (req, res) => {
       body: JSON.stringify(upstreamProtocol === 'responses' ? {
         model: upstreamModel,
         input: prompt,
-        ...(system ? { instructions: String(system) } : {}),
+        ...(upstreamSystem ? { instructions: upstreamSystem } : {}),
         reasoning: { effort: upstreamReasoningEffort },
         ...(typeof temperature === 'number' ? { temperature } : {}),
         stream: false
       } : {
         model: upstreamModel,
         messages: [
-          ...(system ? [{ role: 'system', content: String(system) }] : []),
+          ...(upstreamSystem ? [{ role: 'system', content: upstreamSystem }] : []),
           { role: 'user', content: prompt }
         ],
         reasoning_effort: upstreamReasoningEffort,
@@ -145,6 +162,7 @@ app.post('/api/chat', async (req, res) => {
       model: data?.model || upstreamModel,
       protocol: upstreamProtocol,
       reasoningEffort: upstreamReasoningEffort,
+      skills: appliedSkills.map(({ id: skillId, name, version, mode, source }) => ({ id: skillId, name, version, mode, source })),
       requestId: id
     });
   } catch (error) {

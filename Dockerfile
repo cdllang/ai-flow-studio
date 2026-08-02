@@ -27,6 +27,8 @@ RUN pnpm install --prod --frozen-lockfile && pnpm store prune
 
 COPY --from=builder /app/dist ./dist
 COPY server.mjs ./server.mjs
+COPY skill-registry.mjs ./skill-registry.mjs
+COPY skills ./skills
 
 RUN chown -R node:node /app
 USER node

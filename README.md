@@ -16,6 +16,9 @@
 - 800ms 防抖保存到浏览器 `localStorage`
 - 基础模型真实调用：同时兼容 OpenAI `/chat/completions` 与 `/responses`
 - 大模型节点支持 `low / medium / high / xhigh / max` 五档思考强度，默认 `high`；网关分别转换为 `reasoning_effort` 或 `reasoning.effort`
+- 大模型节点支持多选 Skill；当前服务器白名单内置 `GPT Image 2` Advisor，用于生成可交给下游图像节点的结构化提示词
+- 独立“Skill 中心”：平台指定 Skill 由服务器托管，用户自建 Skill 仅保存在当前浏览器 `localStorage`
+- 本地 Skill 只在被节点选中并运行时随该次请求临时发送，服务端只做校验和内存组合，不写入磁盘或公共 Skill 注册表
 - GPT Image 2 标准调用：OpenAI 兼容 `/images/generations`
 - 节点级运行日志、最终输出、错误状态和品牌演示素材回退
 - 独立“模型服务”页面：可新增多个供应商连接，并将 Base URL、API Key 与用户维护的模型清单成组保存
@@ -40,11 +43,12 @@ pnpm test
 pnpm build
 pnpm verify:config
 pnpm verify:reasoning-drag
+pnpm verify:skills
 pnpm verify:partial-failure
 pnpm verify:multi-output
 ```
 
-22 项单元测试覆盖 Chat Completions/Responses 协议转换、多供应商迁移/解析、多输出规范化、业务绑定、条件多值、DAG 校验、导入导出和预设 ID 重映射。浏览器回归覆盖供应商管理与节点绑定、部分失败保全、多图与对应文案、复制/下载、图库键盘操作、图片比例、删除/撤销、停止运行和条件分支。
+29 项单元测试覆盖 Chat Completions/Responses 协议转换、多供应商迁移/解析、服务器/本地 Skill 注册与指令组合、多输出规范化、业务绑定、条件多值、DAG 校验、导入导出和预设 ID 重映射。浏览器回归覆盖 Skill 中心及节点多选、供应商管理与节点绑定、部分失败保全、多图与对应文案、复制/下载、图库键盘操作、图片比例、删除/撤销、停止运行和条件分支。
 
 “AI 辅助构建工作流”当前只完成技术选型与实现方案，尚未实现，详见 [`AI_WORKFLOW_ASSISTANT_DESIGN.md`](AI_WORKFLOW_ASSISTANT_DESIGN.md)。
 
@@ -82,6 +86,14 @@ docker compose up -d
 文字和图像请求只携带该节点绑定连接的 Base URL、API Key 与模型。旧版浏览器中的基础模型/图像模型配置会自动迁移为两条供应商连接。正式生产建议将浏览器凭证迁移到 Secret Manager。
 
 当前网关实际图像路由为 `gpt-image-2-count`。新测试 Key 已成功真实出图，但上游渠道存在间歇性“无可用渠道”；Demo 会有限重试，仍失败时明确标记并回退到现有品牌演示图片。渠道可用时真实图片会自动替代回退素材。
+
+## Skill 扩展
+
+平台 Skill 使用服务器白名单目录，不会自动安装任意第三方 Skill。每个服务器 Skill 位于 `skills/<skill-id>/`，包含公开元数据 `skill.json` 与仅服务端读取的 `instructions.md`；Docker 镜像目前只打包管理员指定的 `gpt-image-2`。`GET /api/skills` 仅返回可选择的元数据，不返回完整指令。
+
+用户可在顶部“Skills”页面创建自己的 Skill，数据保存在 `aiflow.demo.local-skills`。大模型节点可同时选择服务器 Skill 和本地 Skill；运行时请求分别携带服务器 Skill ID 与当前已选本地 Skill 定义，网关校验数量、长度和格式后临时追加到系统指令。删除或缺失的 Skill 会阻止对应节点运行并给出明确错误，不会被静默忽略。
+
+`GPT Image 2` 在大模型节点内运行于 Advisor 模式，只负责整理图像生成/编辑提示词；实际出图仍由下游图像生成节点调用供应商模型。这一分层可继续接入代码审查、文案规范、数据提取等管理员白名单 Skill，而不需要把用户自建内容长期存到服务器。
 
 ## 安全
 

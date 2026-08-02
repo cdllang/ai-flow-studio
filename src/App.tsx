@@ -60,6 +60,7 @@ import {
 } from 'lucide-react';
 import { OutputPanel } from './components/OutputPanel';
 import { ProviderManager } from './components/ProviderManager';
+import { SkillManager } from './components/SkillManager';
 import {
   legacyCredentialStorageKey,
   normalizeProviderStore,
@@ -70,6 +71,16 @@ import {
   type ModelCapability,
   type ModelProvider
 } from './providerConfig';
+import {
+  localSkillRequest,
+  localSkillStorageKey,
+  maxLocalSkills,
+  normalizeLocalSkillStore,
+  normalizeServerSkillCatalog,
+  validateLocalSkill,
+  type LocalSkillDefinition,
+  type SkillSummary
+} from './skillConfig';
 import {
   applyOutputBindings,
   createWorkflowExport,
@@ -96,6 +107,7 @@ type FlowData = Record<string, unknown> & {
   providerId?: string;
   model?: string;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  skillIds?: string[];
   conditionSource?: 'input' | 'upstream';
   conditionOperator?: 'contains' | 'not_contains' | 'equals' | 'not_equals';
   conditionValue?: string;
@@ -336,17 +348,30 @@ function loadStoredProviders(): ModelProvider[] {
   }
 }
 
+function loadStoredLocalSkills(): LocalSkillDefinition[] {
+  try {
+    return normalizeLocalSkillStore(JSON.parse(localStorage.getItem(localSkillStorageKey) || '{"schemaVersion":1,"skills":[]}'));
+  } catch {
+    return [];
+  }
+}
+
+function normalizeNodeSkillIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((item): item is string => typeof item === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(item)))].slice(0, 8);
+}
+
 function syncNodeProviders(items: Node<FlowData>[], providers: readonly ModelProvider[]): Node<FlowData>[] {
   return items.map((node) => {
     if (node.data.kind !== 'llm' && node.data.kind !== 'image') return node;
     const capability: ModelCapability = node.data.kind === 'image' ? 'image' : 'chat';
     const resolved = resolveNodeProvider(providers, capability, node.data.providerId, node.data.model);
-    if (!resolved) return { ...node, data: { ...node.data, providerId: '', model: '', subtitle: '等待模型配置', ...(node.data.kind === 'llm' ? { reasoningEffort: node.data.reasoningEffort || 'high' } : {}) } };
+    if (!resolved) return { ...node, data: { ...node.data, providerId: '', model: '', subtitle: '等待模型配置', ...(node.data.kind === 'llm' ? { reasoningEffort: node.data.reasoningEffort || 'high', skillIds: normalizeNodeSkillIds(node.data.skillIds) } : {}) } };
     if (node.data.kind === 'image') {
       const suffix = node.data.subtitle.includes(' · ') ? ` · ${node.data.subtitle.split(' · ').slice(1).join(' · ')}` : '';
       return { ...node, data: { ...node.data, providerId: resolved.provider.id, model: resolved.model.id, subtitle: `${resolved.model.id}${suffix}` } };
     }
-    return { ...node, data: { ...node.data, providerId: resolved.provider.id, model: resolved.model.id, subtitle: resolved.model.id, reasoningEffort: node.data.reasoningEffort || 'high' } };
+    return { ...node, data: { ...node.data, providerId: resolved.provider.id, model: resolved.model.id, subtitle: resolved.model.id, reasoningEffort: node.data.reasoningEffort || 'high', skillIds: normalizeNodeSkillIds(node.data.skillIds) } };
   });
 }
 
@@ -428,6 +453,7 @@ function FlowNode({ id, data, selected }: NodeProps<Node<FlowData>>) {
       </div>
       <strong>{data.title}</strong>
       <span className="node-subtitle">{data.subtitle}</span>
+      {data.kind === 'llm' && normalizeNodeSkillIds(data.skillIds).length > 0 && <span className="node-skill-count"><Sparkles size={10} />{normalizeNodeSkillIds(data.skillIds).length} Skill</span>}
       <div className="node-state">
         {status === 'running' ? <LoaderCircle className="spin" size={13} /> : status === 'success' ? <Check size={13} /> : status === 'cancelled' ? <Square size={11} /> : <span className="status-dot" />}
         {status === 'running' ? '运行中' : status === 'success' ? '已完成' : status === 'error' ? '运行失败' : status === 'skipped' ? '已跳过' : status === 'cancelled' ? '已停止' : '等待运行'}
@@ -452,13 +478,16 @@ function App() {
   const savedWorkflow = useMemo(loadSavedWorkflow, []);
   const initialProviders = useMemo(loadStoredProviders, []);
   const [providers, setProviders] = useState<ModelProvider[]>(initialProviders);
+  const [skillCatalog, setSkillCatalog] = useState<SkillSummary[]>([]);
+  const [localSkills, setLocalSkills] = useState<LocalSkillDefinition[]>(loadStoredLocalSkills);
+  const [skillCatalogStatus, setSkillCatalogStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [nodes, setNodes] = useState<Node<FlowData>[]>(() => syncNodeProviders(savedWorkflow?.nodes ?? initialNodes, initialProviders));
   const [edges, setEdges] = useState<Edge[]>(savedWorkflow?.edges ?? initialEdges);
   const [selectedId, setSelectedId] = useState<string>('llm-1');
   const [debugOpen, setDebugOpen] = useState(true);
   const [libraryOpen, setLibraryOpen] = useState(true);
   const [configPanelOpen, setConfigPanelOpen] = useState(true);
-  const [workspaceView, setWorkspaceView] = useState<'editor' | 'models' | 'runs' | 'versions'>(() => initialProviders.some((provider) => provider.apiKey) ? 'editor' : 'models');
+  const [workspaceView, setWorkspaceView] = useState<'editor' | 'models' | 'skills' | 'runs' | 'versions'>(() => initialProviders.some((provider) => provider.apiKey) ? 'editor' : 'models');
   const [undoStack, setUndoStack] = useState<WorkflowSnapshot[]>([]);
   const [runRecords, setRunRecords] = useState<RunRecord[]>(() => loadStoredList<RunRecord>('aiflow.demo.runs').map((record) => ({ ...record, result: coerceOutputBundle(record.result) })));
   const [versions, setVersions] = useState<VersionRecord[]>(() => loadStoredList<VersionRecord>('aiflow.demo.versions'));
@@ -486,11 +515,36 @@ function App() {
   const selectedCapability: ModelCapability | null = selectedNode?.data.kind === 'llm' ? 'chat' : selectedNode?.data.kind === 'image' ? 'image' : null;
   const selectedProviderOptions = selectedCapability ? providersForCapability(providers, selectedCapability) : [];
   const selectedConnection = selectedCapability ? resolveNodeProvider(providers, selectedCapability, selectedNode?.data.providerId, selectedNode?.data.model) : null;
+  const selectedSkillIds = selectedNode?.data.kind === 'llm' ? normalizeNodeSkillIds(selectedNode.data.skillIds) : [];
+  const llmSkills = [...skillCatalog, ...localSkills].filter((skill) => skill.nodeKinds.includes('llm'));
+  const missingSelectedSkillIds = selectedSkillIds.filter((skillId) => !llmSkills.some((skill) => skill.id === skillId));
 
   useEffect(() => {
     localStorage.setItem(providerStorageKey, JSON.stringify({ schemaVersion: 1, providers }));
     localStorage.removeItem(legacyCredentialStorageKey);
   }, [providers]);
+
+  useEffect(() => {
+    localStorage.setItem(localSkillStorageKey, JSON.stringify({ schemaVersion: 1, skills: localSkills }));
+  }, [localSkills]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch('/api/skills', { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Skill catalog returned ${response.status}`);
+        return response.json();
+      })
+      .then((data) => {
+        setSkillCatalog(normalizeServerSkillCatalog(data));
+        setSkillCatalogStatus('ready');
+      })
+      .catch((error) => {
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+        setSkillCatalogStatus('error');
+      });
+    return () => controller.abort();
+  }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -581,6 +635,26 @@ function App() {
     const next = providers.filter((provider) => provider.id !== providerId);
     setProviders(next);
     setNodes((items) => syncNodeProviders(items, next));
+  };
+
+  const saveLocalSkill = (skill: LocalSkillDefinition) => {
+    const error = validateLocalSkill(skill);
+    if (error) return error;
+    if (skillCatalog.some((candidate) => candidate.id === skill.id)) return '本地 Skill ID 不能与服务器 Skill 冲突';
+    if (!localSkills.some((candidate) => candidate.id === skill.id) && localSkills.length >= maxLocalSkills) return `本地 Skill 最多保存 ${maxLocalSkills} 个`;
+    setLocalSkills((items) => items.some((candidate) => candidate.id === skill.id)
+      ? items.map((candidate) => candidate.id === skill.id ? skill : candidate)
+      : [...items, skill]);
+    return null;
+  };
+
+  const deleteLocalSkill = (skillId: string) => {
+    rememberSnapshot();
+    setLocalSkills((items) => items.filter((skill) => skill.id !== skillId));
+    setNodes((items) => items.map((node) => node.data.kind === 'llm'
+      ? { ...node, data: { ...node.data, skillIds: normalizeNodeSkillIds(node.data.skillIds).filter((id) => id !== skillId) } }
+      : node));
+    setToast('本地 Skill 已删除并从当前工作流解绑');
   };
 
   const setReferenceFile = (file?: File) => {
@@ -700,7 +774,7 @@ function App() {
         ...(kind === 'code' ? { code: 'return { text: String(input ?? "") };' } : {}),
         ...(kind === 'aggregate' ? { aggregateStrategy: 'object' } : {}),
         ...(kind === 'output' ? { outputKey: `output_${count}` } : {}),
-        ...(kind === 'llm' ? { providerId: connection?.provider.id || '', model: connection?.model.id || '', reasoningEffort: 'high' } : {}),
+        ...(kind === 'llm' ? { providerId: connection?.provider.id || '', model: connection?.model.id || '', reasoningEffort: 'high', skillIds: [] } : {}),
         ...(kind === 'image' ? { providerId: connection?.provider.id || '', model: connection?.model.id || '', imageSize: '1024x1024', imageQuality: 'high', imageCount: 1 } : {})
       }
     };
@@ -870,16 +944,25 @@ function App() {
         } else if (node.data.kind === 'llm') {
           const connection = resolveNodeProvider(providers, 'chat', node.data.providerId, node.data.model);
           if (!connection?.provider.apiKey) throw new NodeExecutionError('节点绑定的文本模型供应商或 API Key 不可用', 'PROVIDER_CREDENTIAL_MISSING');
+          const nodeSkillIds = normalizeNodeSkillIds(node.data.skillIds);
+          const selectedServerSkillIds = nodeSkillIds.filter((skillId) => skillCatalog.some((skill) => skill.id === skillId));
+          const selectedLocalSkills = nodeSkillIds.flatMap((skillId) => {
+            const skill = localSkills.find((candidate) => candidate.id === skillId);
+            return skill ? [skill] : [];
+          });
+          const availableSkillIds = new Set([...selectedServerSkillIds, ...selectedLocalSkills.map((skill) => skill.id)]);
+          const unavailableSkillIds = nodeSkillIds.filter((skillId) => !availableSkillIds.has(skillId));
+          if (unavailableSkillIds.length) throw new NodeExecutionError(`节点引用了不可用的 Skill：${unavailableSkillIds.join('、')}`, 'SKILL_NOT_AVAILABLE');
           const response = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': connection.provider.apiKey },
             signal: controller.signal,
-            body: JSON.stringify({ prompt: upstreamText, system: node.data.prompt, baseUrl: connection.provider.baseUrl, model: connection.model.id, protocol: connection.model.protocol || 'chat-completions', reasoningEffort: node.data.reasoningEffort || 'high' })
+            body: JSON.stringify({ prompt: upstreamText, system: node.data.prompt, baseUrl: connection.provider.baseUrl, model: connection.model.id, protocol: connection.model.protocol || 'chat-completions', reasoningEffort: node.data.reasoningEffort || 'high', skillIds: selectedServerSkillIds, localSkills: selectedLocalSkills.map(localSkillRequest) })
           });
           const data = await response.json();
           if (!response.ok) throw new NodeExecutionError(data.message || '基础模型调用失败', data.code || 'CHAT_REQUEST_FAILED', { requestId: data.requestId, httpStatus: response.status });
           output = { text: data.text, value: data };
-          detail = `生成完成 · ${data.usage?.total_tokens ?? '—'} tokens`;
+          detail = `生成完成 · ${data.usage?.total_tokens ?? '—'} tokens${Array.isArray(data.skills) && data.skills.length ? ` · ${data.skills.length} Skill` : ''}`;
         } else if (node.data.kind === 'image') {
           const connection = resolveNodeProvider(providers, 'image', node.data.providerId, node.data.model);
           if (!connection?.provider.apiKey) throw new NodeExecutionError('节点绑定的图像模型供应商或 API Key 不可用', 'PROVIDER_CREDENTIAL_MISSING');
@@ -1064,6 +1147,7 @@ function App() {
         <nav className="header-center" aria-label="工作流导航">
           <button className={workspaceView === 'editor' ? 'active' : ''} onClick={() => setWorkspaceView('editor')}>编排</button>
           <button className={workspaceView === 'models' ? 'active' : ''} onClick={() => setWorkspaceView('models')}>模型服务</button>
+          <button className={workspaceView === 'skills' ? 'active' : ''} onClick={() => setWorkspaceView('skills')}>Skills</button>
           <button className={workspaceView === 'runs' ? 'active' : ''} onClick={() => setWorkspaceView('runs')}>运行记录</button>
           <button className={workspaceView === 'versions' ? 'active' : ''} onClick={() => setWorkspaceView('versions')}>版本</button>
         </nav>
@@ -1147,7 +1231,7 @@ function App() {
             <Controls showInteractive={false} />
           </ReactFlow>
           <div className="canvas-status"><span className="live-dot" /> 自动保存已开启 <b>·</b> 节点可从左侧拖入</div>
-          </> : workspaceView === 'models' ? <ProviderManager providers={providers} onSave={saveProvider} onDelete={deleteProvider} /> : workspaceView === 'runs' ? <div className="workspace-data-view">
+          </> : workspaceView === 'models' ? <ProviderManager providers={providers} onSave={saveProvider} onDelete={deleteProvider} /> : workspaceView === 'skills' ? <SkillManager serverSkills={skillCatalog} localSkills={localSkills} catalogStatus={skillCatalogStatus} onSave={saveLocalSkill} onDelete={deleteLocalSkill} /> : workspaceView === 'runs' ? <div className="workspace-data-view">
             <header><div><strong>运行记录</strong><small>最近 {runRecords.length} 次工作流执行</small></div></header>
             {runRecords.length ? <div className="record-list">{runRecords.map((record) => <article key={record.id}><span className={`record-state ${record.status}`} /> <div><strong>{record.status === 'success' ? '运行成功' : record.status === 'partial' ? '部分成功' : record.status === 'cancelled' ? '用户停止' : '运行失败'}</strong><small>{new Date(record.startedAt).toLocaleString()} · {record.logs.length} 个节点</small></div><code>{record.duration}</code><button onClick={() => { setRunLogs(record.logs); setResult(record.result); setWorkspaceView('editor'); setDebugOpen(true); setActiveDebug(record.status === 'success' || record.status === 'partial' ? 'output' : 'logs'); }}>查看详情</button></article>)}</div> : <div className="data-empty"><TerminalSquare size={24} /><strong>暂无运行记录</strong><span>试运行工作流后会自动保存在这里</span></div>}
           </div> : <div className="workspace-data-view">
@@ -1208,6 +1292,45 @@ function App() {
                 </select>
               </label>}
               <button className="variable-button" onClick={() => setWorkspaceView('models')}><Settings size={14} />管理供应商与模型</button>
+            </div>}
+            {selectedNode.data.kind === 'llm' && <div className="form-section skill-section">
+              <div className="skill-section-head">
+                <div><Sparkles size={14} /><h3>Skill</h3></div>
+                <small>节点级 · 可多选</small>
+              </div>
+              <p className="skill-section-copy">按执行顺序向系统指令追加专业能力，选择会随工作流保存和导出。</p>
+              <div className="skill-list" aria-label="节点 Skill 列表">
+                {skillCatalogStatus === 'loading' && <div className="skill-empty"><LoaderCircle className="spin" size={14} />正在读取 Skill 注册表</div>}
+                {skillCatalogStatus === 'error' && <div className="skill-empty error">Skill 注册表加载失败，请检查服务端配置</div>}
+                {skillCatalogStatus === 'ready' && !llmSkills.length && <div className="skill-empty">暂无适用于大模型节点的 Skill</div>}
+                {llmSkills.map((skill) => {
+                  const enabled = selectedSkillIds.includes(skill.id);
+                  return <button
+                    type="button"
+                    key={skill.id}
+                    className={`skill-option ${enabled ? 'active' : ''}`}
+                    aria-label={`${enabled ? '停用' : '启用'} Skill ${skill.name}`}
+                    aria-pressed={enabled}
+                    onClick={() => {
+                      if (enabled) return updateSelected({ skillIds: selectedSkillIds.filter((skillId) => skillId !== skill.id) });
+                      if (selectedSkillIds.length >= 8) return setToast('单个节点最多启用 8 个 Skill');
+                      updateSelected({ skillIds: [...selectedSkillIds, skill.id] });
+                    }}
+                  >
+                    <span className="skill-option-icon"><Sparkles size={14} /></span>
+                    <span className="skill-option-copy"><strong>{skill.name}</strong><small>{skill.description}</small><em>{skill.source === 'local' ? '本地 · Advisor' : skill.mode === 'advisor' ? '服务器 · Advisor' : `服务器 · ${skill.mode}`}</em></span>
+                    <code>v{skill.version}</code>
+                    <span className="skill-option-check">{enabled && <Check size={12} />}</span>
+                  </button>;
+                })}
+                {missingSelectedSkillIds.map((skillId) => <button type="button" key={skillId} className="skill-option unavailable" aria-label={`移除不可用 Skill ${skillId}`} onClick={() => updateSelected({ skillIds: selectedSkillIds.filter((id) => id !== skillId) })}>
+                  <span className="skill-option-icon"><Sparkles size={14} /></span>
+                  <span className="skill-option-copy"><strong>{skillId}</strong><small>当前服务端未安装此 Skill，运行前请移除或恢复注册。</small><em>不可用</em></span>
+                  <X size={13} />
+                </button>)}
+              </div>
+              <div className="skill-note"><ImageIcon size={14} /><span><strong>GPT Image 2 Skill</strong>以 Advisor 模式生成图像提示词；请连接下游图像生成节点完成出图。</span></div>
+              <button className="variable-button skill-manage-button" onClick={() => setWorkspaceView('skills')}><Settings size={14} />管理本地 Skill</button>
             </div>}
             {selectedNode.data.kind === 'llm' && <div className="form-section">
               <h3>提示词</h3>
