@@ -106,6 +106,7 @@ export function OutputPanel({ bundle, onError }: OutputPanelProps) {
   }
 
   return <div className="output-collection">
+    {bundle.error && <div className="output-partial-warning" role="alert"><strong>部分输出生成失败</strong><span>{bundle.error.split('\n')[0]}</span></div>}
     <div className="output-collection-head">
       <div><strong>工作流输出集合</strong><small>{bundle.groups.length} 个输出组 · {items.length} 个结果项</small></div>
       <div>

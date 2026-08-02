@@ -26,8 +26,6 @@ import {
   ClipboardCopy,
   Code2,
   Combine,
-  Copy,
-  Download,
   FileJson,
   FileDown,
   FileUp,
@@ -55,16 +53,20 @@ import {
   Upload,
   Webhook,
   X,
-  ZoomIn,
   Square
 } from 'lucide-react';
 import { OutputPanel } from './components/OutputPanel';
+import { ProviderManager } from './components/ProviderManager';
 import {
-  fallbackModelConfig,
-  normalizeModelConnectionConfig,
-  validateModelConnectionConfig,
-  type ModelConnectionConfig
-} from './modelConfig';
+  legacyCredentialStorageKey,
+  normalizeProviderStore,
+  providerStorageKey,
+  providersForCapability,
+  resolveNodeProvider,
+  validateProvider,
+  type ModelCapability,
+  type ModelProvider
+} from './providerConfig';
 import {
   applyOutputBindings,
   createWorkflowExport,
@@ -88,6 +90,7 @@ type FlowData = Record<string, unknown> & {
   subtitle: string;
   status?: NodeStatus;
   prompt?: string;
+  providerId?: string;
   model?: string;
   conditionSource?: 'input' | 'upstream';
   conditionOperator?: 'contains' | 'not_contains' | 'equals' | 'not_equals';
@@ -105,30 +108,65 @@ type FlowData = Record<string, unknown> & {
   bindings?: OutputBinding[];
 };
 
-type ApiStatus = {
-  baseUrl?: string;
-  chatBaseUrl: string;
-  imageBaseUrl: string;
-  chatConfigured: boolean;
-  imageConfigured: boolean;
-  chatKeyHint: string | null;
-  imageKeyHint: string | null;
-  defaultChatModel: string;
-  imageModel: string;
-};
-
-type StoredApiKeys = ModelConnectionConfig & {
-  chatApiKey: string;
-  imageApiKey: string;
-};
-
 type RunLog = {
   id: string;
   title: string;
   detail: string;
   status: 'success' | 'running' | 'muted' | 'error' | 'skipped';
   elapsed?: string;
+  kind?: NodeKind;
+  code?: string;
+  requestId?: string;
+  httpStatus?: number;
+  upstreamNodeIds?: string[];
+  occurredAt?: string;
 };
+
+type NodeFailure = {
+  nodeId: string;
+  title: string;
+  kind: NodeKind;
+  message: string;
+  code: string;
+  requestId?: string;
+  httpStatus?: number;
+  upstreamNodeIds: string[];
+  elapsed: string;
+  occurredAt: string;
+};
+
+class NodeExecutionError extends Error {
+  code: string;
+  requestId?: string;
+  httpStatus?: number;
+
+  constructor(message: string, code: string, options: { requestId?: string; httpStatus?: number } = {}) {
+    super(message);
+    this.name = 'NodeExecutionError';
+    this.code = code;
+    this.requestId = options.requestId;
+    this.httpStatus = options.httpStatus;
+  }
+}
+
+function failureSummary(failures: readonly NodeFailure[]) {
+  const lines = failures.map((failure, index) => {
+    const metadata = [failure.code, failure.httpStatus ? `HTTP ${failure.httpStatus}` : '', failure.requestId ? `requestId=${failure.requestId}` : '', failure.elapsed].filter(Boolean).join(' · ');
+    return `${index + 1}. ${failure.title} (${failure.nodeId} / ${failure.kind})\n   ${failure.message}\n   ${metadata}${failure.upstreamNodeIds.length ? `\n   上游：${failure.upstreamNodeIds.join(', ')}` : ''}`;
+  });
+  return `部分节点执行失败：${failures.length} 个失败，已保留其他分支的成功输出。\n${lines.join('\n')}`;
+}
+
+function detailedRunLog(logs: readonly RunLog[], result: WorkflowOutputBundle) {
+  const lines = logs.map((log) => {
+    const metadata = [log.kind, log.id, log.code, log.httpStatus ? `HTTP ${log.httpStatus}` : '', log.requestId ? `requestId=${log.requestId}` : '', log.elapsed, log.occurredAt].filter(Boolean).join(' · ');
+    const upstream = log.upstreamNodeIds?.length ? `\n  upstream=${log.upstreamNodeIds.join(',')}` : '';
+    return `[${log.status.toUpperCase()}] ${log.title}${metadata ? ` [${metadata}]` : ''}\n  ${log.detail}${upstream}`;
+  });
+  if (result.error) lines.push(`[SUMMARY]\n${result.error}`);
+  else if (result.notice) lines.push(`[INFO]\n${result.notice}`);
+  return lines.length ? lines.join('\n\n') : '[INFO] 暂无运行日志\n[INFO] 本地 API 网关已就绪';
+}
 
 type WorkflowSnapshot = { nodes: Node<FlowData>[]; edges: Edge[] };
 
@@ -140,7 +178,7 @@ type RuntimeOutput = RuntimeOutputLike & {
 type RunRecord = {
   id: string;
   startedAt: string;
-  status: 'success' | 'error' | 'cancelled';
+  status: 'success' | 'partial' | 'error' | 'cancelled';
   duration: string;
   logs: RunLog[];
   result: WorkflowOutputBundle;
@@ -283,46 +321,27 @@ function loadStoredList<T>(key: string): T[] {
   }
 }
 
-const apiKeysStorageKey = 'aiflow.demo.apiKeys';
-
-function loadStoredApiKeys(): StoredApiKeys {
+function loadStoredProviders(): ModelProvider[] {
   try {
-    const value = JSON.parse(localStorage.getItem(apiKeysStorageKey) || '{}');
-    return {
-      chatApiKey: typeof value.chatApiKey === 'string' ? value.chatApiKey : '',
-      imageApiKey: typeof value.imageApiKey === 'string' ? value.imageApiKey : '',
-      chatBaseUrl: typeof value.chatBaseUrl === 'string' ? value.chatBaseUrl : typeof value.baseUrl === 'string' ? value.baseUrl : '',
-      imageBaseUrl: typeof value.imageBaseUrl === 'string' ? value.imageBaseUrl : typeof value.baseUrl === 'string' ? value.baseUrl : '',
-      chatModel: typeof value.chatModel === 'string' ? value.chatModel : '',
-      imageModel: typeof value.imageModel === 'string' ? value.imageModel : ''
-    };
+    const stored = localStorage.getItem(providerStorageKey);
+    const legacy = JSON.parse(localStorage.getItem(legacyCredentialStorageKey) || '{}');
+    return normalizeProviderStore(stored ? JSON.parse(stored) : undefined, legacy).providers;
   } catch {
-    return { chatApiKey: '', imageApiKey: '', chatBaseUrl: '', imageBaseUrl: '', chatModel: '', imageModel: '' };
+    return normalizeProviderStore(undefined).providers;
   }
 }
 
-function statusWithLocalKeys(status: ApiStatus, keys: StoredApiKeys): ApiStatus {
-  return {
-    ...status,
-    chatBaseUrl: keys.chatBaseUrl || status.chatBaseUrl || status.baseUrl || fallbackModelConfig.chatBaseUrl,
-    imageBaseUrl: keys.imageBaseUrl || status.imageBaseUrl || status.baseUrl || fallbackModelConfig.imageBaseUrl,
-    defaultChatModel: keys.chatModel || status.defaultChatModel,
-    imageModel: keys.imageModel || status.imageModel,
-    chatConfigured: Boolean(keys.chatApiKey),
-    imageConfigured: Boolean(keys.imageApiKey),
-    chatKeyHint: keys.chatApiKey ? `••••${keys.chatApiKey.slice(-4)}` : null,
-    imageKeyHint: keys.imageApiKey ? `••••${keys.imageApiKey.slice(-4)}` : null
-  };
-}
-
-function syncNodeModels(items: Node<FlowData>[], modelConfig: ModelConnectionConfig): Node<FlowData>[] {
+function syncNodeProviders(items: Node<FlowData>[], providers: readonly ModelProvider[]): Node<FlowData>[] {
   return items.map((node) => {
-    if (node.data.kind === 'llm') return { ...node, data: { ...node.data, model: modelConfig.chatModel, subtitle: modelConfig.chatModel } };
+    if (node.data.kind !== 'llm' && node.data.kind !== 'image') return node;
+    const capability: ModelCapability = node.data.kind === 'image' ? 'image' : 'chat';
+    const resolved = resolveNodeProvider(providers, capability, node.data.providerId, node.data.model);
+    if (!resolved) return { ...node, data: { ...node.data, providerId: '', model: '', subtitle: '等待模型配置' } };
     if (node.data.kind === 'image') {
       const suffix = node.data.subtitle.includes(' · ') ? ` · ${node.data.subtitle.split(' · ').slice(1).join(' · ')}` : '';
-      return { ...node, data: { ...node.data, model: modelConfig.imageModel, subtitle: `${modelConfig.imageModel}${suffix}` } };
+      return { ...node, data: { ...node.data, providerId: resolved.provider.id, model: resolved.model.id, subtitle: `${resolved.model.id}${suffix}` } };
     }
-    return node;
+    return { ...node, data: { ...node.data, providerId: resolved.provider.id, model: resolved.model.id, subtitle: resolved.model.id } };
   });
 }
 
@@ -426,18 +445,19 @@ function BrandMark() {
 
 function App() {
   const savedWorkflow = useMemo(loadSavedWorkflow, []);
-  const [nodes, setNodes] = useState<Node<FlowData>[]>(savedWorkflow?.nodes ?? initialNodes);
+  const initialProviders = useMemo(loadStoredProviders, []);
+  const [providers, setProviders] = useState<ModelProvider[]>(initialProviders);
+  const [nodes, setNodes] = useState<Node<FlowData>[]>(() => syncNodeProviders(savedWorkflow?.nodes ?? initialNodes, initialProviders));
   const [edges, setEdges] = useState<Edge[]>(savedWorkflow?.edges ?? initialEdges);
   const [selectedId, setSelectedId] = useState<string>('llm-1');
   const [debugOpen, setDebugOpen] = useState(true);
   const [libraryOpen, setLibraryOpen] = useState(true);
   const [configPanelOpen, setConfigPanelOpen] = useState(true);
-  const [workspaceView, setWorkspaceView] = useState<'editor' | 'runs' | 'versions'>('editor');
+  const [workspaceView, setWorkspaceView] = useState<'editor' | 'models' | 'runs' | 'versions'>(() => initialProviders.some((provider) => provider.apiKey) ? 'editor' : 'models');
   const [undoStack, setUndoStack] = useState<WorkflowSnapshot[]>([]);
   const [runRecords, setRunRecords] = useState<RunRecord[]>(() => loadStoredList<RunRecord>('aiflow.demo.runs').map((record) => ({ ...record, result: coerceOutputBundle(record.result) })));
   const [versions, setVersions] = useState<VersionRecord[]>(() => loadStoredList<VersionRecord>('aiflow.demo.versions'));
   const [toast, setToast] = useState('');
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [nodeSearch, setNodeSearch] = useState('');
   const [workflowTitle, setWorkflowTitle] = useState(savedWorkflow?.title ?? '社媒主视觉生成器');
   const [presetOpen, setPresetOpen] = useState(false);
@@ -450,55 +470,20 @@ function App() {
   const [referenceImage, setReferenceImage] = useState<ReferenceImage | null>(null);
   const [imageInputError, setImageInputError] = useState('');
   const [draggingImage, setDraggingImage] = useState(false);
-  const [apiKeys, setApiKeys] = useState<StoredApiKeys>(loadStoredApiKeys);
-  const [config, setConfig] = useState<ApiStatus | null>(null);
-  const [chatBaseUrlInput, setChatBaseUrlInput] = useState('');
-  const [imageBaseUrlInput, setImageBaseUrlInput] = useState('');
-  const [chatModelInput, setChatModelInput] = useState('');
-  const [imageModelInput, setImageModelInput] = useState('');
-  const [chatApiKey, setChatApiKey] = useState('');
-  const [imageApiKey, setImageApiKey] = useState('');
-  const [clearChatKey, setClearChatKey] = useState(false);
-  const [clearImageKey, setClearImageKey] = useState(false);
-  const [configSaving, setConfigSaving] = useState(false);
-  const [configMessage, setConfigMessage] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
   const [activeDebug, setActiveDebug] = useState<'process' | 'output' | 'logs'>('process');
   const abortControllerRef = useRef<AbortController | null>(null);
   const stopRequestedRef = useRef(false);
   const importWorkflowRef = useRef<HTMLInputElement | null>(null);
   const selectedNode = nodes.find((node) => node.id === selectedId);
-  const configuredChatModel = apiKeys.chatModel || config?.defaultChatModel || fallbackModelConfig.chatModel;
-  const configuredImageModel = apiKeys.imageModel || config?.imageModel || fallbackModelConfig.imageModel;
+  const configuredProviderCount = providers.filter((provider) => provider.apiKey).length;
+  const selectedCapability: ModelCapability | null = selectedNode?.data.kind === 'llm' ? 'chat' : selectedNode?.data.kind === 'image' ? 'image' : null;
+  const selectedProviderOptions = selectedCapability ? providersForCapability(providers, selectedCapability) : [];
+  const selectedConnection = selectedCapability ? resolveNodeProvider(providers, selectedCapability, selectedNode?.data.providerId, selectedNode?.data.model) : null;
 
   useEffect(() => {
-    fetch('/api/config/status')
-      .then((response) => response.json())
-      .then((status: ApiStatus) => {
-        const resolvedConnection = normalizeModelConnectionConfig(apiKeys, {
-          chatBaseUrl: status.chatBaseUrl || status.baseUrl || fallbackModelConfig.chatBaseUrl,
-          imageBaseUrl: status.imageBaseUrl || status.baseUrl || fallbackModelConfig.imageBaseUrl,
-          chatModel: status.defaultChatModel,
-          imageModel: status.imageModel
-        });
-        const resolvedKeys = { ...apiKeys, ...resolvedConnection };
-        const localStatus = statusWithLocalKeys(status, resolvedKeys);
-        setApiKeys(resolvedKeys);
-        setConfig(localStatus);
-        setChatBaseUrlInput(localStatus.chatBaseUrl);
-        setImageBaseUrlInput(localStatus.imageBaseUrl);
-        setChatModelInput(localStatus.defaultChatModel);
-        setImageModelInput(localStatus.imageModel);
-        if (!localStatus.chatConfigured || !localStatus.imageConfigured) {
-          setConfigMessage({ kind: 'error', text: '请先配置基础模型和图像模型 API Key，再运行工作流' });
-          setSettingsOpen(true);
-        }
-      })
-      .catch(() => {
-        setConfig(null);
-        setConfigMessage({ kind: 'error', text: '无法读取模型配置，请确认本地服务已启动' });
-        setSettingsOpen(true);
-      });
-  }, []);
+    localStorage.setItem(providerStorageKey, JSON.stringify({ schemaVersion: 1, providers }));
+    localStorage.removeItem(legacyCredentialStorageKey);
+  }, [providers]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -573,72 +558,22 @@ function App() {
     setToast('已撤销上一步操作');
   };
 
-  const openSettings = () => {
-    setChatBaseUrlInput(config?.chatBaseUrl || apiKeys.chatBaseUrl || fallbackModelConfig.chatBaseUrl);
-    setImageBaseUrlInput(config?.imageBaseUrl || apiKeys.imageBaseUrl || fallbackModelConfig.imageBaseUrl);
-    setChatModelInput(config?.defaultChatModel || apiKeys.chatModel || fallbackModelConfig.chatModel);
-    setImageModelInput(config?.imageModel || apiKeys.imageModel || fallbackModelConfig.imageModel);
-    setChatApiKey('');
-    setImageApiKey('');
-    setClearChatKey(false);
-    setClearImageKey(false);
-    setConfigMessage(null);
-    setSettingsOpen(true);
+  const saveProvider = (provider: ModelProvider) => {
+    const peers = providers.filter((candidate) => candidate.id !== provider.id);
+    const error = validateProvider(provider, peers);
+    if (error) return error;
+    const next = providers.some((candidate) => candidate.id === provider.id)
+      ? providers.map((candidate) => candidate.id === provider.id ? provider : candidate)
+      : [...providers, provider];
+    setProviders(next);
+    setNodes((items) => syncNodeProviders(items, next));
+    return null;
   };
 
-  const closeSettings = () => {
-    if (!config?.chatConfigured || !config?.imageConfigured) {
-      setConfigMessage({ kind: 'error', text: '必须完成两类 API Key 配置后才能关闭' });
-      return;
-    }
-    setSettingsOpen(false);
-  };
-
-  const saveApiKeys = async () => {
-    setConfigSaving(true);
-    setConfigMessage(null);
-    try {
-      const connection = normalizeModelConnectionConfig({
-        chatBaseUrl: chatBaseUrlInput,
-        imageBaseUrl: imageBaseUrlInput,
-        chatModel: chatModelInput,
-        imageModel: imageModelInput
-      }, {
-        chatBaseUrl: config?.chatBaseUrl || fallbackModelConfig.chatBaseUrl,
-        imageBaseUrl: config?.imageBaseUrl || fallbackModelConfig.imageBaseUrl,
-        chatModel: config?.defaultChatModel || fallbackModelConfig.chatModel,
-        imageModel: config?.imageModel || fallbackModelConfig.imageModel
-      });
-      const validationError = validateModelConnectionConfig(connection);
-      if (validationError) throw new Error(validationError);
-      const nextKeys = {
-        chatApiKey: clearChatKey ? '' : chatApiKey.trim() || apiKeys.chatApiKey,
-        imageApiKey: clearImageKey ? '' : imageApiKey.trim() || apiKeys.imageApiKey,
-        ...connection
-      };
-      localStorage.setItem(apiKeysStorageKey, JSON.stringify(nextKeys));
-      setApiKeys(nextKeys);
-      setConfig((current) => statusWithLocalKeys(current || {
-        chatBaseUrl: fallbackModelConfig.chatBaseUrl,
-        imageBaseUrl: fallbackModelConfig.imageBaseUrl,
-        chatConfigured: false,
-        imageConfigured: false,
-        chatKeyHint: null,
-        imageKeyHint: null,
-        defaultChatModel: fallbackModelConfig.chatModel,
-        imageModel: fallbackModelConfig.imageModel
-      }, nextKeys));
-      setNodes((items) => syncNodeModels(items, connection));
-      setChatApiKey('');
-      setImageApiKey('');
-      setClearChatKey(false);
-      setClearImageKey(false);
-      setConfigMessage({ kind: 'success', text: '连接参数与 API Key 已保存到当前浏览器并立即生效' });
-    } catch (error) {
-      setConfigMessage({ kind: 'error', text: error instanceof Error ? error.message : '配置保存失败' });
-    } finally {
-      setConfigSaving(false);
-    }
+  const deleteProvider = (providerId: string) => {
+    const next = providers.filter((provider) => provider.id !== providerId);
+    setProviders(next);
+    setNodes((items) => syncNodeProviders(items, next));
   };
 
   const setReferenceFile = (file?: File) => {
@@ -705,7 +640,7 @@ function App() {
         if (importedNodes.some((node) => !node.data?.kind || !(node.data.kind in nodeMeta))) throw new Error('工作流包含当前版本不支持的节点');
         rememberSnapshot();
         const cleanImportedNodes = importedNodes.map((node) => ({ ...node, data: { ...node.data, status: 'idle' as NodeStatus } }));
-        setNodes(syncNodeModels(cleanImportedNodes, normalizeModelConnectionConfig(apiKeys)));
+        setNodes(syncNodeProviders(cleanImportedNodes, providers));
         setEdges(document.workflow.edges as Edge[]);
         setWorkflowTitle(typeof document.workflow.title === 'string' ? document.workflow.title : file.name.replace(/\.aiflow\.json$|\.json$/i, ''));
         setInput(typeof document.workflow.input === 'string' ? document.workflow.input : '');
@@ -725,7 +660,7 @@ function App() {
     if (nodes.length && !window.confirm(`使用“${preset.name}”将替换当前画布，是否继续？替换后仍可点击撤销恢复结构。`)) return;
     rememberSnapshot();
     const instance = instantiatePreset(preset);
-    setNodes(syncNodeModels(instance.nodes as unknown as Node<FlowData>[], normalizeModelConnectionConfig(apiKeys)));
+    setNodes(syncNodeProviders(instance.nodes as unknown as Node<FlowData>[], providers));
     setEdges(instance.edges as Edge[]);
     setWorkflowTitle(instance.name);
     setInput(instance.sampleInput);
@@ -740,7 +675,8 @@ function App() {
 
   const addNode = (kind: NodeKind) => {
     rememberSnapshot();
-    const connection = normalizeModelConnectionConfig(apiKeys);
+    const capability: ModelCapability | null = kind === 'llm' ? 'chat' : kind === 'image' ? 'image' : null;
+    const connection = capability ? resolveNodeProvider(providers, capability) : null;
     const count = nodes.filter((node) => node.data.kind === kind).length + 1;
     const id = `${kind}-${Date.now()}`;
     const node: Node<FlowData> = {
@@ -750,15 +686,15 @@ function App() {
       data: {
         kind,
         title: `${nodeMeta[kind].label} ${count}`,
-        subtitle: kind === 'condition' ? '判断上游文本' : kind === 'http' ? 'GET · 未配置 URL' : kind === 'code' ? 'JavaScript · Worker' : kind === 'aggregate' ? '按来源聚合 · object' : kind === 'llm' ? connection.chatModel : kind === 'image' ? `${connection.imageModel} · 1:1 · 1024×1024` : '点击配置节点',
+        subtitle: kind === 'condition' ? '判断上游文本' : kind === 'http' ? 'GET · 未配置 URL' : kind === 'code' ? 'JavaScript · Worker' : kind === 'aggregate' ? '按来源聚合 · object' : kind === 'llm' ? connection?.model.id || '等待模型配置' : kind === 'image' ? `${connection?.model.id || '等待模型配置'} · 1:1 · 1024×1024` : '点击配置节点',
         status: 'idle',
         ...(kind === 'condition' ? { conditionSource: 'upstream', conditionOperator: 'contains', conditionValue: '' } : {}),
         ...(kind === 'http' ? { httpMethod: 'GET', httpUrl: '', httpHeaders: '{}', httpBody: '' } : {}),
         ...(kind === 'code' ? { code: 'return { text: String(input ?? "") };' } : {}),
         ...(kind === 'aggregate' ? { aggregateStrategy: 'object' } : {}),
         ...(kind === 'output' ? { outputKey: `output_${count}` } : {}),
-        ...(kind === 'llm' ? { model: connection.chatModel } : {}),
-        ...(kind === 'image' ? { model: connection.imageModel, imageSize: '1024x1024', imageQuality: 'high', imageCount: 1 } : {})
+        ...(kind === 'llm' ? { providerId: connection?.provider.id || '', model: connection?.model.id || '' } : {}),
+        ...(kind === 'image' ? { providerId: connection?.provider.id || '', model: connection?.model.id || '', imageSize: '1024x1024', imageQuality: 'high', imageCount: 1 } : {})
       }
     };
     setNodes((items) => [...items, node]);
@@ -821,12 +757,17 @@ function App() {
       return;
     }
     const reachableSet = new Set(validation.reachableNodeIds);
-    const requiresChat = nodes.some((node) => reachableSet.has(node.id) && node.data.kind === 'llm');
-    const requiresImage = nodes.some((node) => reachableSet.has(node.id) && node.data.kind === 'image');
-    const missingCredentials = [requiresChat && !config?.chatConfigured ? '基础模型' : '', requiresImage && !config?.imageConfigured ? '图像模型' : ''].filter(Boolean);
-    if (missingCredentials.length) {
-      setConfigMessage({ kind: 'error', text: `当前工作流需要配置：${missingCredentials.join('、')} API Key` });
-      setSettingsOpen(true);
+    const modelConfigurationIssues = nodes.flatMap((node) => {
+      if (!reachableSet.has(node.id) || (node.data.kind !== 'llm' && node.data.kind !== 'image')) return [];
+      const capability: ModelCapability = node.data.kind === 'image' ? 'image' : 'chat';
+      const resolved = resolveNodeProvider(providers, capability, node.data.providerId, node.data.model);
+      if (!resolved) return [`${node.data.title}：没有可用的${capability === 'chat' ? '文本' : '图像'}模型供应商`];
+      if (!resolved.provider.apiKey) return [`${node.data.title}：${resolved.provider.name} 尚未填写 API Key`];
+      return [];
+    });
+    if (modelConfigurationIssues.length) {
+      setToast(`运行前请完成模型服务配置：${modelConfigurationIssues[0]}`);
+      setWorkspaceView('models');
       return;
     }
     const startNode = nodes.find((node) => node.data.kind === 'start')!;
@@ -844,6 +785,8 @@ function App() {
     const logs: RunLog[] = [];
     const outputs = new Map<string, RuntimeOutput>();
     const skipped = new Set<string>();
+    const blocked = new Set<string>();
+    const failures = new Map<string, NodeFailure>();
     let finalResult = emptyOutputBundle();
     let recordStatus: RunRecord['status'] = 'success';
 
@@ -885,15 +828,26 @@ function App() {
         const activeIncoming = incoming.filter(edgeIsActive);
         if (node.data.kind !== 'start' && incoming.length > 0 && activeIncoming.length === 0) {
           skipped.add(node.id);
+          const failedIncoming = incoming.filter((edge) => failures.has(edge.source) || blocked.has(edge.source));
+          if (failedIncoming.length) blocked.add(node.id);
           setNodeStatus(node.id, 'skipped');
-          logs.push({ id: node.id, title: node.data.title, detail: '条件分支未命中，已跳过', status: 'skipped' });
+          logs.push({
+            id: node.id,
+            title: node.data.title,
+            kind: node.data.kind,
+            detail: failedIncoming.length ? `上游失败，当前节点已阻断：${failedIncoming.map((edge) => nodeById.get(edge.source)?.data.title || edge.source).join('、')}` : '条件分支未命中，已跳过',
+            status: 'skipped',
+            code: failedIncoming.length ? 'UPSTREAM_FAILED' : 'BRANCH_NOT_SELECTED',
+            upstreamNodeIds: failedIncoming.map((edge) => edge.source),
+            occurredAt: new Date().toISOString()
+          });
           setRunLogs([...logs]);
           return;
         }
 
         const nodeStarted = performance.now();
         const logIndex = logs.length;
-        logs.push({ id: node.id, title: node.data.title, detail: `${nodeMeta[node.data.kind].label}正在执行`, status: 'running' });
+        logs.push({ id: node.id, title: node.data.title, kind: node.data.kind, detail: `${nodeMeta[node.data.kind].label}正在执行`, status: 'running', upstreamNodeIds: activeIncoming.map((edge) => edge.source), occurredAt: new Date().toISOString() });
         setRunLogs([...logs]);
         setNodeStatus(node.id, 'running');
         const upstream = activeIncoming.map((edge) => outputs.get(edge.source)!).filter(Boolean);
@@ -901,30 +855,35 @@ function App() {
         let output: RuntimeOutput = {};
         let detail = '执行完成';
 
+        try {
         if (node.data.kind === 'start') {
           await abortableDelay(180, controller.signal);
           output = { text: input, value: { text: input, referenceImage } };
           detail = referenceImage ? '文字与参考图片输入校验通过' : '文字输入校验通过';
         } else if (node.data.kind === 'llm') {
+          const connection = resolveNodeProvider(providers, 'chat', node.data.providerId, node.data.model);
+          if (!connection?.provider.apiKey) throw new NodeExecutionError('节点绑定的文本模型供应商或 API Key 不可用', 'PROVIDER_CREDENTIAL_MISSING');
           const response = await fetch('/api/chat', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': apiKeys.chatApiKey },
+            headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': connection.provider.apiKey },
             signal: controller.signal,
-            body: JSON.stringify({ prompt: upstreamText, system: node.data.prompt, baseUrl: apiKeys.chatBaseUrl, model: node.data.model || apiKeys.chatModel })
+            body: JSON.stringify({ prompt: upstreamText, system: node.data.prompt, baseUrl: connection.provider.baseUrl, model: connection.model.id })
           });
           const data = await response.json();
-          if (!response.ok) throw new Error(data.message || '基础模型调用失败');
+          if (!response.ok) throw new NodeExecutionError(data.message || '基础模型调用失败', data.code || 'CHAT_REQUEST_FAILED', { requestId: data.requestId, httpStatus: response.status });
           output = { text: data.text, value: data };
           detail = `生成完成 · ${data.usage?.total_tokens ?? '—'} tokens`;
         } else if (node.data.kind === 'image') {
+          const connection = resolveNodeProvider(providers, 'image', node.data.providerId, node.data.model);
+          if (!connection?.provider.apiKey) throw new NodeExecutionError('节点绑定的图像模型供应商或 API Key 不可用', 'PROVIDER_CREDENTIAL_MISSING');
           const response = await fetch('/api/images', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': apiKeys.imageApiKey },
+            headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': connection.provider.apiKey },
             signal: controller.signal,
-            body: JSON.stringify({ prompt: upstreamText, size: node.data.imageSize || '1024x1024', quality: node.data.imageQuality || 'high', count: node.data.imageCount || 1, referenceImage, baseUrl: apiKeys.imageBaseUrl, model: node.data.model || apiKeys.imageModel })
+            body: JSON.stringify({ prompt: upstreamText, size: node.data.imageSize || '1024x1024', quality: node.data.imageQuality || 'high', count: node.data.imageCount || 1, referenceImage, baseUrl: connection.provider.baseUrl, model: connection.model.id })
           });
           const data = await response.json();
-          if (!response.ok) throw new Error(data.message || '图像模型调用失败');
+          if (!response.ok) throw new NodeExecutionError(data.message || '图像模型调用失败', data.code || 'IMAGE_REQUEST_FAILED', { requestId: data.requestId, httpStatus: response.status });
           const [imageWidth, imageHeight] = String(node.data.imageSize || '1024x1024').split('x');
           const records = Array.isArray(data.images) && data.images.length ? data.images : [data];
           const images = records.map((item: Record<string, unknown>, index: number) => {
@@ -952,7 +911,7 @@ function App() {
             body: JSON.stringify({ method: node.data.httpMethod || 'GET', url: node.data.httpUrl, headers, body: node.data.httpBody?.replaceAll('{{input}}', upstreamText) })
           });
           const data = await response.json();
-          if (!response.ok) throw new Error(data.message || 'HTTP 节点请求失败');
+          if (!response.ok) throw new NodeExecutionError(data.message || 'HTTP 节点请求失败', data.code || 'HTTP_NODE_REQUEST_FAILED', { requestId: data.requestId, httpStatus: response.status });
           const text = typeof data.body === 'string' ? data.body : JSON.stringify(data.body, null, 2);
           output = { text, value: data.body, status: data.status };
           detail = `HTTP ${data.status}`;
@@ -1018,14 +977,53 @@ function App() {
         setNodeStatus(node.id, 'success');
         logs[logIndex] = { ...logs[logIndex], status: 'success', detail, elapsed: `${((performance.now() - nodeStarted) / 1000).toFixed(1)}s` };
         setRunLogs([...logs]);
+        } catch (error) {
+          if (error instanceof DOMException && error.name === 'AbortError') throw error;
+          const elapsed = `${((performance.now() - nodeStarted) / 1000).toFixed(1)}s`;
+          const typed = error instanceof NodeExecutionError ? error : null;
+          const failure: NodeFailure = {
+            nodeId: node.id,
+            title: node.data.title,
+            kind: node.data.kind,
+            message: error instanceof Error ? error.message : String(error || '节点执行失败'),
+            code: typed?.code || `${node.data.kind.toUpperCase()}_EXECUTION_FAILED`,
+            requestId: typed?.requestId,
+            httpStatus: typed?.httpStatus,
+            upstreamNodeIds: activeIncoming.map((edge) => edge.source),
+            elapsed,
+            occurredAt: new Date().toISOString()
+          };
+          failures.set(node.id, failure);
+          setNodeStatus(node.id, 'error');
+          logs[logIndex] = {
+            ...logs[logIndex],
+            status: 'error',
+            detail: failure.message,
+            elapsed,
+            code: failure.code,
+            requestId: failure.requestId,
+            httpStatus: failure.httpStatus,
+            upstreamNodeIds: failure.upstreamNodeIds,
+            occurredAt: failure.occurredAt
+          };
+          setRunLogs([...logs]);
+        }
       };
 
       for (const layer of layers) {
         await Promise.all(layer.map((id) => executeNode(nodeById.get(id)!)));
       }
 
-      if (!finalResult.groups.length) throw new Error(`没有可达的结束节点，起点为 ${startNode.data.title}`);
-      setActiveDebug('output');
+      const failureList = [...failures.values()];
+      if (failureList.length) {
+        recordStatus = finalResult.groups.length ? 'partial' : 'error';
+        finalResult = { ...finalResult, error: failureSummary(failureList) };
+        setResult(finalResult);
+        setActiveDebug(finalResult.groups.length ? 'output' : 'logs');
+      } else {
+        if (!finalResult.groups.length) throw new Error(`没有可达的结束节点，起点为 ${startNode.data.title}`);
+        setActiveDebug('output');
+      }
     } catch (error) {
       const cancelled = stopRequestedRef.current || (error instanceof DOMException && error.name === 'AbortError');
       if (!cancelled) controller.abort();
@@ -1034,7 +1032,7 @@ function App() {
       setNodes((items) => items.map((node) => node.data.status === 'running' || node.data.status === 'waiting' ? { ...node, data: { ...node.data, status: cancelled ? 'cancelled' : 'error' } } : node));
       logs.forEach((log, index) => { if (log.status === 'running') logs[index] = { ...log, status: cancelled ? 'muted' : 'error', detail: message }; });
       setRunLogs([...logs]);
-      finalResult = { ...emptyOutputBundle(), ...(cancelled ? { notice: message } : { error: message }) };
+      finalResult = { ...finalResult, ...(cancelled ? { notice: message } : { error: message }) };
       setResult(finalResult);
       setActiveDebug('logs');
     } finally {
@@ -1058,6 +1056,7 @@ function App() {
         </div>
         <nav className="header-center" aria-label="工作流导航">
           <button className={workspaceView === 'editor' ? 'active' : ''} onClick={() => setWorkspaceView('editor')}>编排</button>
+          <button className={workspaceView === 'models' ? 'active' : ''} onClick={() => setWorkspaceView('models')}>模型服务</button>
           <button className={workspaceView === 'runs' ? 'active' : ''} onClick={() => setWorkspaceView('runs')}>运行记录</button>
           <button className={workspaceView === 'versions' ? 'active' : ''} onClick={() => setWorkspaceView('versions')}>版本</button>
         </nav>
@@ -1067,14 +1066,14 @@ function App() {
           <button className="icon-button" aria-label="导出工作流" onClick={exportWorkflow}><FileDown size={17} /></button>
           <button className="icon-button" aria-label="导入工作流" onClick={() => importWorkflowRef.current?.click()}><FileUp size={17} /></button>
           <input ref={importWorkflowRef} className="visually-hidden" type="file" accept="application/json,.json,.aiflow.json" onChange={(event) => { importWorkflow(event.target.files?.[0]); event.target.value = ''; }} />
-          <button className="ghost-button" onClick={openSettings}><Settings size={16} /> 模型配置</button>
+          <button className="ghost-button" onClick={() => setWorkspaceView('models')}><Settings size={16} /> 模型服务</button>
           {running ? <button className="stop-button" onClick={stopWorkflow}><Square size={14} fill="currentColor" /> 停止运行</button> : <button className="run-button" onClick={runWorkflow}><Play size={16} fill="currentColor" />试运行</button>}
           <button className="publish-button" onClick={publishWorkflow} disabled={running}><Rocket size={16} /> 发布</button>
         </div>
       </header>
 
-      <main className={`editor-layout ${debugOpen && workspaceView === 'editor' ? 'debug-open' : ''} ${!libraryOpen ? 'library-closed' : ''} ${!configPanelOpen ? 'config-closed' : ''}`}>
-        {libraryOpen && <aside className="node-library">
+      <main className={`editor-layout ${workspaceView !== 'editor' ? 'data-mode' : ''} ${debugOpen && workspaceView === 'editor' ? 'debug-open' : ''} ${!libraryOpen ? 'library-closed' : ''} ${!configPanelOpen ? 'config-closed' : ''}`}>
+        {workspaceView === 'editor' && libraryOpen && <aside className="node-library">
           <div className="panel-heading">
             <div><span>节点库</span><small>{nodes.length} 个节点</small></div>
             <button className="icon-button tiny" aria-label="折叠节点库" onClick={() => setLibraryOpen(false)}><Menu size={16} /></button>
@@ -1124,18 +1123,18 @@ function App() {
             <Controls showInteractive={false} />
           </ReactFlow>
           <div className="canvas-status"><span className="live-dot" /> 自动保存已开启 <b>·</b> 画布可拖拽缩放</div>
-          </> : workspaceView === 'runs' ? <div className="workspace-data-view">
+          </> : workspaceView === 'models' ? <ProviderManager providers={providers} onSave={saveProvider} onDelete={deleteProvider} /> : workspaceView === 'runs' ? <div className="workspace-data-view">
             <header><div><strong>运行记录</strong><small>最近 {runRecords.length} 次工作流执行</small></div></header>
-            {runRecords.length ? <div className="record-list">{runRecords.map((record) => <article key={record.id}><span className={`record-state ${record.status}`} /> <div><strong>{record.status === 'success' ? '运行成功' : record.status === 'cancelled' ? '用户停止' : '运行失败'}</strong><small>{new Date(record.startedAt).toLocaleString()} · {record.logs.length} 个节点</small></div><code>{record.duration}</code><button onClick={() => { setRunLogs(record.logs); setResult(record.result); setWorkspaceView('editor'); setDebugOpen(true); setActiveDebug(record.status === 'success' ? 'output' : 'logs'); }}>查看详情</button></article>)}</div> : <div className="data-empty"><TerminalSquare size={24} /><strong>暂无运行记录</strong><span>试运行工作流后会自动保存在这里</span></div>}
+            {runRecords.length ? <div className="record-list">{runRecords.map((record) => <article key={record.id}><span className={`record-state ${record.status}`} /> <div><strong>{record.status === 'success' ? '运行成功' : record.status === 'partial' ? '部分成功' : record.status === 'cancelled' ? '用户停止' : '运行失败'}</strong><small>{new Date(record.startedAt).toLocaleString()} · {record.logs.length} 个节点</small></div><code>{record.duration}</code><button onClick={() => { setRunLogs(record.logs); setResult(record.result); setWorkspaceView('editor'); setDebugOpen(true); setActiveDebug(record.status === 'success' || record.status === 'partial' ? 'output' : 'logs'); }}>查看详情</button></article>)}</div> : <div className="data-empty"><TerminalSquare size={24} /><strong>暂无运行记录</strong><span>试运行工作流后会自动保存在这里</span></div>}
           </div> : <div className="workspace-data-view">
             <header><div><strong>发布版本</strong><small>可恢复最近 20 个本地版本</small></div><button className="publish-button" onClick={publishWorkflow}><Rocket size={14} />发布当前版本</button></header>
             {versions.length ? <div className="record-list version-list">{versions.map((version) => <article key={`${version.id}-${version.createdAt}`}><span className="version-badge">{version.id}</span><div><strong>{version.nodes.length} 个节点 · {version.edges.length} 条连接</strong><small>{new Date(version.createdAt).toLocaleString()}</small></div><button onClick={() => restoreVersion(version)}>恢复到画布</button></article>)}</div> : <div className="data-empty"><Rocket size={24} /><strong>尚未发布版本</strong><span>点击右上角“发布”保存首个版本</span></div>}
           </div>}
-          {!libraryOpen && <button className="open-side-panel left" onClick={() => setLibraryOpen(true)}><PanelLeftOpen size={15} />展开节点库</button>}
-          {!configPanelOpen && <button className="open-side-panel right" onClick={() => setConfigPanelOpen(true)}><PanelRightOpen size={15} />展开配置</button>}
+          {workspaceView === 'editor' && !libraryOpen && <button className="open-side-panel left" onClick={() => setLibraryOpen(true)}><PanelLeftOpen size={15} />展开节点库</button>}
+          {workspaceView === 'editor' && !configPanelOpen && <button className="open-side-panel right" onClick={() => setConfigPanelOpen(true)}><PanelRightOpen size={15} />展开配置</button>}
         </section>
 
-        {configPanelOpen && <aside className="config-panel">
+        {workspaceView === 'editor' && configPanelOpen && <aside className="config-panel">
           <div className="panel-heading">
             <div><span>节点配置</span><small>{selectedNode?.data.kind ? nodeMeta[selectedNode.data.kind].label : '未选择'}</small></div>
             <button className="icon-button tiny" aria-label="关闭节点配置" onClick={() => setConfigPanelOpen(false)}><X size={16} /></button>
@@ -1152,20 +1151,29 @@ function App() {
             </div>
             {(selectedNode.data.kind === 'llm' || selectedNode.data.kind === 'image') && <div className="form-section">
               <h3>模型</h3>
-              <label>模型 ID
-                <select value={selectedNode.data.model || ''} onChange={(event) => updateSelected({ model: event.target.value, subtitle: event.target.value })}>
-                  {selectedNode.data.kind === 'image' ? <>
-                    <option value={configuredImageModel}>{configuredImageModel}（当前连接）</option>
-                    {configuredImageModel !== 'gpt-image-2' && <option value="gpt-image-2">gpt-image-2</option>}
-                  </> : <>
-                    <option value={configuredChatModel}>{configuredChatModel}（当前连接）</option>
-                    {configuredChatModel !== 'gpt-5.4-mini' && <option value="gpt-5.4-mini">gpt-5.4-mini</option>}
-                    {configuredChatModel !== 'gpt-5.6-terra' && <option value="gpt-5.6-terra">gpt-5.6-terra</option>}
-                    {configuredChatModel !== 'gpt-5.6-sol' && <option value="gpt-5.6-sol">gpt-5.6-sol</option>}
-                  </>}
+              <label>供应商连接
+                <select aria-label="节点供应商连接" value={selectedConnection?.provider.id || ''} onChange={(event) => {
+                  const provider = selectedProviderOptions.find((candidate) => candidate.id === event.target.value);
+                  const capability: ModelCapability = selectedNode.data.kind === 'image' ? 'image' : 'chat';
+                  const model = provider?.models.find((candidate) => candidate.capability === capability);
+                  const suffix = selectedNode.data.kind === 'image' && selectedNode.data.subtitle.includes(' · ') ? ` · ${selectedNode.data.subtitle.split(' · ').slice(1).join(' · ')}` : '';
+                  updateSelected({ providerId: provider?.id || '', model: model?.id || '', subtitle: `${model?.id || '等待模型配置'}${suffix}` });
+                }}>
+                  {!selectedProviderOptions.length && <option value="">请先添加兼容供应商</option>}
+                  {selectedProviderOptions.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}{provider.apiKey ? '' : '（未配置 Key）'}</option>)}
                 </select>
               </label>
-              <div className="credential-row"><KeyRound size={14} /><span>{selectedNode.data.kind === 'image' ? '图像模型凭证' : '基础模型凭证'}</span><b className={selectedNode.data.kind === 'image' ? config?.imageConfigured ? 'ok' : '' : config?.chatConfigured ? 'ok' : ''}>{selectedNode.data.kind === 'image' ? config?.imageConfigured ? '已配置' : '未配置' : config?.chatConfigured ? '已配置' : '未配置'}</b></div>
+              <label>模型 ID
+                <select aria-label="节点模型 ID" value={selectedConnection?.model.id || ''} onChange={(event) => {
+                  const suffix = selectedNode.data.kind === 'image' && selectedNode.data.subtitle.includes(' · ') ? ` · ${selectedNode.data.subtitle.split(' · ').slice(1).join(' · ')}` : '';
+                  updateSelected({ model: event.target.value, subtitle: `${event.target.value}${suffix}` });
+                }}>
+                  {!selectedConnection && <option value="">暂无可用模型</option>}
+                  {selectedConnection?.provider.models.filter((model) => model.capability === selectedCapability).map((model) => <option key={`${model.capability}:${model.id}`} value={model.id}>{model.id}</option>)}
+                </select>
+              </label>
+              <div className="credential-row"><KeyRound size={14} /><span>{selectedConnection?.provider.name || '尚未绑定供应商'}</span><b className={selectedConnection?.provider.apiKey ? 'ok' : ''}>{selectedConnection?.provider.apiKey ? `Key ••••${selectedConnection.provider.apiKey.slice(-4)}` : '未配置'}</b></div>
+              <button className="variable-button" onClick={() => setWorkspaceView('models')}><Settings size={14} />管理供应商与模型</button>
             </div>}
             {selectedNode.data.kind === 'llm' && <div className="form-section">
               <h3>提示词</h3>
@@ -1237,7 +1245,7 @@ function App() {
               <button className={activeDebug === 'output' ? 'active' : ''} onClick={() => setActiveDebug('output')}>最终输出</button>
               <button className={activeDebug === 'logs' ? 'active' : ''} onClick={() => setActiveDebug('logs')}>日志</button>
             </div>
-            <div><span className={`config-pill ${config?.chatConfigured && config?.imageConfigured ? 'ready' : ''}`}><span /> {config?.chatConfigured && config?.imageConfigured ? '模型已连接' : '等待模型配置'}</span><button className="icon-button tiny" onClick={() => setDebugOpen(false)}><PanelBottomClose size={16} /></button></div>
+            <div><span className={`config-pill ${configuredProviderCount ? 'ready' : ''}`}><span /> {configuredProviderCount ? `${configuredProviderCount} 个供应商已就绪` : '等待模型配置'}</span><button className="icon-button tiny" onClick={() => setDebugOpen(false)}><PanelBottomClose size={16} /></button></div>
           </div>
           <div className="debug-body">
             <div className="test-input">
@@ -1263,7 +1271,7 @@ function App() {
             <div className="run-output">
               {activeDebug === 'process' && <div className="run-timeline">{runLogs.map((log) => <div className={`timeline-item ${log.status}`} key={log.id}><span className="timeline-status">{log.status === 'success' ? <Check size={13} /> : log.status === 'running' ? <LoaderCircle className="spin" size={13} /> : log.status === 'error' ? <X size={13} /> : <span />}</span><div><strong>{log.title}</strong><small>{log.detail}</small></div><time>{log.elapsed}</time></div>)}</div>}
               {activeDebug === 'output' && <div className="output-box"><OutputPanel bundle={result} onError={(message) => setResult((previous) => ({ ...previous, error: message }))} /></div>}
-              {activeDebug === 'logs' && <div className={`log-view ${result.error ? 'error' : ''}`}><TerminalSquare size={17} /><pre>{result.error ? `[ERROR] ${result.error}` : result.notice ? `[INFO] ${result.notice}` : '[INFO] 暂无错误日志\n[INFO] 本地 API 网关已就绪'}</pre></div>}
+              {activeDebug === 'logs' && <div className={`log-view ${result.error ? 'error' : ''}`}><TerminalSquare size={17} /><pre>{detailedRunLog(runLogs, result)}</pre></div>}
             </div>
           </div>
         </section>}
@@ -1285,43 +1293,6 @@ function App() {
         </section>
       </div>}
 
-      {settingsOpen && <div className="modal-backdrop" role="presentation" onMouseDown={closeSettings}>
-        <section className="settings-modal" role="dialog" aria-modal="true" aria-label="模型配置" onMouseDown={(event) => event.stopPropagation()}>
-          <header><div><span className="modal-icon"><Settings size={18} /></span><div><strong>模型服务配置</strong><small>{config?.chatConfigured && config?.imageConfigured ? 'OpenAI 兼容网关' : '首次使用需要完成 API Key 配置'}</small></div></div><button className="icon-button" onClick={closeSettings} aria-label="关闭模型配置"><X size={18} /></button></header>
-          <div className="settings-body">
-            <div className="provider-fields">
-              <div className="provider-fields-head"><div><strong>供应商连接参数</strong><small>基础模型与图像模型可分别接入不同的 OpenAI 兼容服务</small></div><button type="button" onClick={() => { setChatBaseUrlInput(fallbackModelConfig.chatBaseUrl); setImageBaseUrlInput(fallbackModelConfig.imageBaseUrl); setChatModelInput(fallbackModelConfig.chatModel); setImageModelInput(fallbackModelConfig.imageModel); }}>恢复原始默认值</button></div>
-              <div className="provider-supplier-grid">
-                <article className="provider-supplier-card">
-                  <div className="supplier-title"><span className="connection-icon"><Bot size={18} /></span><div><strong>基础模型供应商</strong><small>POST /chat/completions</small></div><b className={config?.chatConfigured ? 'connected' : ''}>{config?.chatConfigured ? '已连接' : '未配置'}</b></div>
-                  <label><span>基础模型 Base URL</span><div className="service-input"><Webhook size={15} /><input aria-label="基础模型 Base URL" value={chatBaseUrlInput} onChange={(event) => setChatBaseUrlInput(event.target.value)} placeholder={fallbackModelConfig.chatBaseUrl} /></div></label>
-                  <label><span>基础模型名称</span><div className="service-input"><Bot size={15} /><input aria-label="基础模型名称" value={chatModelInput} onChange={(event) => setChatModelInput(event.target.value)} placeholder={fallbackModelConfig.chatModel} /></div></label>
-                </article>
-                <article className="provider-supplier-card warm">
-                  <div className="supplier-title"><span className="connection-icon warm"><ImageIcon size={18} /></span><div><strong>图像模型供应商</strong><small>POST /images/generations</small></div><b className={config?.imageConfigured ? 'connected' : ''}>{config?.imageConfigured ? '已连接' : '未配置'}</b></div>
-                  <label><span>图像模型 Base URL</span><div className="service-input warm"><Webhook size={15} /><input aria-label="图像模型 Base URL" value={imageBaseUrlInput} onChange={(event) => setImageBaseUrlInput(event.target.value)} placeholder={fallbackModelConfig.imageBaseUrl} /></div></label>
-                  <label><span>图像模型名称</span><div className="service-input warm"><ImageIcon size={15} /><input aria-label="图像模型名称" value={imageModelInput} onChange={(event) => setImageModelInput(event.target.value)} placeholder={fallbackModelConfig.imageModel} /></div></label>
-                </article>
-              </div>
-            </div>
-            <div className="key-fields">
-              <label className={clearChatKey ? 'is-clearing' : ''}>
-                <span><b>基础模型 API Key</b><small>{config?.chatConfigured ? `已保存 ${config.chatKeyHint || ''}` : '尚未配置'}</small></span>
-                <div className="secret-input"><KeyRound size={15} /><input type="password" autoComplete="new-password" value={chatApiKey} onChange={(event) => { setChatApiKey(event.target.value); setClearChatKey(false); }} disabled={clearChatKey} placeholder={config?.chatConfigured ? '留空则保持当前 Key' : '手动填写 API Key'} /></div>
-                {config?.chatConfigured && <button type="button" className="clear-key-button" onClick={() => { setClearChatKey((value) => !value); setChatApiKey(''); }}>{clearChatKey ? '取消清除' : '清除已保存 Key'}</button>}
-              </label>
-              <label className={clearImageKey ? 'is-clearing' : ''}>
-                <span><b>GPT Image 2 API Key</b><small>{config?.imageConfigured ? `已保存 ${config.imageKeyHint || ''}` : '尚未配置'}</small></span>
-                <div className="secret-input"><KeyRound size={15} /><input type="password" autoComplete="new-password" value={imageApiKey} onChange={(event) => { setImageApiKey(event.target.value); setClearImageKey(false); }} disabled={clearImageKey} placeholder={config?.imageConfigured ? '留空则保持当前 Key' : '手动填写 API Key'} /></div>
-                {config?.imageConfigured && <button type="button" className="clear-key-button" onClick={() => { setClearImageKey((value) => !value); setImageApiKey(''); }}>{clearImageKey ? '取消清除' : '清除已保存 Key'}</button>}
-              </label>
-            </div>
-            {configMessage && <div className={`config-message ${configMessage.kind}`}>{configMessage.kind === 'success' && <Check size={14} />}{configMessage.text}</div>}
-            <div className="security-note"><KeyRound size={17} /><p><strong>连接参数与 Key 仅保存在当前浏览器 localStorage</strong><span>服务端不持久化完整配置；模型调用时配置仅随本次请求发送。清理浏览器站点数据会同时删除配置。</span></p></div>
-          </div>
-          <footer><button className="ghost-button" onClick={closeSettings} disabled={configSaving}>关闭</button><button className="publish-button" onClick={saveApiKeys} disabled={configSaving}>{configSaving ? <LoaderCircle className="spin" size={15} /> : <KeyRound size={15} />}{configSaving ? '保存中' : '保存配置'}</button></footer>
-        </section>
-      </div>}
     </div>
   );
 }

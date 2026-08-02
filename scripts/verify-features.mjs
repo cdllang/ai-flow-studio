@@ -19,24 +19,10 @@ page.on('console', (message) => {
   if (message.type() === 'error' || message.type() === 'warning') consoleProblems.push(`${message.type()}: ${message.text()}`);
 });
 page.on('pageerror', (error) => pageErrors.push(error.message));
-await page.route('**/api/config/status', (route) => route.fulfill({
-  status: 200,
-  contentType: 'application/json',
-  body: JSON.stringify({
-    baseUrl: 'https://ai.aiwanai.com.cn/v1',
-    chatConfigured: false,
-    imageConfigured: false,
-    chatKeyHint: null,
-    imageKeyHint: null,
-    defaultChatModel: 'gpt-5.4-mini',
-    imageModel: 'gpt-image-2-count'
-  })
-}));
-
 await page.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
-const autoConfigDialog = await page.getByRole('dialog', { name: '模型配置' }).isVisible();
-await page.getByRole('button', { name: '关闭模型配置' }).click();
-const closeBlocked = await page.getByRole('dialog', { name: '模型配置' }).isVisible();
+const autoProviderPage = await page.getByText('管理供应商网关、API Key 与节点可选模型').isVisible();
+await page.getByRole('button', { name: '试运行' }).click();
+const runBlockedOnProviderPage = await page.getByText('管理供应商网关、API Key 与节点可选模型').isVisible();
 await page.screenshot({ path: path.join(screenshotDir, 'auto-config-modal.png'), fullPage: true });
 
 const mockPage = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
@@ -45,19 +31,6 @@ mockPage.on('console', (message) => {
   if (message.type() === 'error' || message.type() === 'warning') consoleProblems.push(`${message.type()}: ${message.text()}`);
 });
 mockPage.on('pageerror', (error) => pageErrors.push(error.message));
-await mockPage.route('**/api/config/status', (route) => route.fulfill({
-  status: 200,
-  contentType: 'application/json',
-  body: JSON.stringify({
-    baseUrl: 'https://ai.aiwanai.com.cn/v1',
-    chatConfigured: true,
-    imageConfigured: true,
-    chatKeyHint: '••••test',
-    imageKeyHint: '••••test',
-    defaultChatModel: 'gpt-5.4-mini',
-    imageModel: 'gpt-image-2-count'
-  })
-}));
 await mockPage.route('**/api/chat', (route) => {
   chatKeyForwarded = route.request().headers()['x-aiflow-api-key'] === 'test-chat-key';
   return route.fulfill({
@@ -106,8 +79,8 @@ const compactLayout = await mockPage.evaluate(() => ({
 }));
 
 const result = {
-  autoConfigDialog,
-  closeBlocked,
+  autoProviderPage,
+  runBlockedOnProviderPage,
   referencePreview,
   textOutputVisible: await mockPage.locator('.output-copy-card').isVisible(),
   imageOutputVisible: await mockPage.locator('.output-image-card').isVisible(),
