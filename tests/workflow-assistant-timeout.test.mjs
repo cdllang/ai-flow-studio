@@ -32,8 +32,10 @@ test('workflow intent retries one transient model timeout instead of exposing th
         questions: ['是否保留现有输出？']
       }) } }] }));
     };
-    if (mode === 'fail' || calls === 1) setTimeout(reply, 80);
-    else reply();
+    if (mode === 'fail' || calls === 1) {
+      const timer = setTimeout(reply, 5_000);
+      response.once('close', () => clearTimeout(timer));
+    } else reply();
   });
   const upstreamPort = await listen(upstream);
   const gatewayPort = await freePort();
@@ -45,7 +47,8 @@ test('workflow intent retries one transient model timeout instead of exposing th
       PORT: String(gatewayPort),
       NODE_ENV: 'test',
       ALLOW_PRIVATE_MODEL_BASE_URL: 'true',
-      ASSISTANT_MODEL_TIMEOUT_MS: '30',
+      // Keep a wide margin for a fresh HTTP connection on loaded Linux CI runners.
+      ASSISTANT_MODEL_TIMEOUT_MS: '500',
       ASSISTANT_MODEL_RETRY_DELAY_MS: '1'
     },
     stdio: ['ignore', 'pipe', 'pipe']
