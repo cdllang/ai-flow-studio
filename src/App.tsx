@@ -14,7 +14,9 @@ import {
   type EdgeChange,
   type Node,
   type NodeChange,
-  type NodeProps
+  type NodeProps,
+  type ReactFlowInstance,
+  type XYPosition
 } from '@xyflow/react';
 import {
   ArrowLeft,
@@ -31,6 +33,7 @@ import {
   FileUp,
   FileText,
   GitBranch,
+  GripVertical,
   Image as ImageIcon,
   KeyRound,
   LayoutTemplate,
@@ -92,6 +95,7 @@ type FlowData = Record<string, unknown> & {
   prompt?: string;
   providerId?: string;
   model?: string;
+  reasoningEffort?: 'low' | 'medium' | 'high';
   conditionSource?: 'input' | 'upstream';
   conditionOperator?: 'contains' | 'not_contains' | 'equals' | 'not_equals';
   conditionValue?: string;
@@ -267,6 +271,7 @@ const initialNodes: Node<FlowData>[] = [
       title: '生成视觉方案',
       subtitle: 'gpt-5.4-mini',
       model: 'gpt-5.4-mini',
+      reasoningEffort: 'high',
       prompt: '请将用户的内容需求扩写为一份清晰、具体、可执行的中文图片提示词。',
       status: 'idle'
     }
@@ -336,12 +341,12 @@ function syncNodeProviders(items: Node<FlowData>[], providers: readonly ModelPro
     if (node.data.kind !== 'llm' && node.data.kind !== 'image') return node;
     const capability: ModelCapability = node.data.kind === 'image' ? 'image' : 'chat';
     const resolved = resolveNodeProvider(providers, capability, node.data.providerId, node.data.model);
-    if (!resolved) return { ...node, data: { ...node.data, providerId: '', model: '', subtitle: '等待模型配置' } };
+    if (!resolved) return { ...node, data: { ...node.data, providerId: '', model: '', subtitle: '等待模型配置', ...(node.data.kind === 'llm' ? { reasoningEffort: node.data.reasoningEffort || 'high' } : {}) } };
     if (node.data.kind === 'image') {
       const suffix = node.data.subtitle.includes(' · ') ? ` · ${node.data.subtitle.split(' · ').slice(1).join(' · ')}` : '';
       return { ...node, data: { ...node.data, providerId: resolved.provider.id, model: resolved.model.id, subtitle: `${resolved.model.id}${suffix}` } };
     }
-    return { ...node, data: { ...node.data, providerId: resolved.provider.id, model: resolved.model.id, subtitle: resolved.model.id } };
+    return { ...node, data: { ...node.data, providerId: resolved.provider.id, model: resolved.model.id, subtitle: resolved.model.id, reasoningEffort: node.data.reasoningEffort || 'high' } };
   });
 }
 
@@ -470,10 +475,12 @@ function App() {
   const [referenceImage, setReferenceImage] = useState<ReferenceImage | null>(null);
   const [imageInputError, setImageInputError] = useState('');
   const [draggingImage, setDraggingImage] = useState(false);
+  const [draggedLibraryKind, setDraggedLibraryKind] = useState<NodeKind | null>(null);
   const [activeDebug, setActiveDebug] = useState<'process' | 'output' | 'logs'>('process');
   const abortControllerRef = useRef<AbortController | null>(null);
   const stopRequestedRef = useRef(false);
   const importWorkflowRef = useRef<HTMLInputElement | null>(null);
+  const reactFlowInstanceRef = useRef<ReactFlowInstance<Node<FlowData>, Edge> | null>(null);
   const selectedNode = nodes.find((node) => node.id === selectedId);
   const configuredProviderCount = providers.filter((provider) => provider.apiKey).length;
   const selectedCapability: ModelCapability | null = selectedNode?.data.kind === 'llm' ? 'chat' : selectedNode?.data.kind === 'image' ? 'image' : null;
@@ -673,7 +680,7 @@ function App() {
     setToast(`已应用电商预设：${instance.name}`);
   };
 
-  const addNode = (kind: NodeKind) => {
+  const addNode = (kind: NodeKind, position?: XYPosition) => {
     rememberSnapshot();
     const capability: ModelCapability | null = kind === 'llm' ? 'chat' : kind === 'image' ? 'image' : null;
     const connection = capability ? resolveNodeProvider(providers, capability) : null;
@@ -682,7 +689,7 @@ function App() {
     const node: Node<FlowData> = {
       id,
       type: 'flowNode',
-      position: { x: 470 + count * 26, y: 330 + count * 18 },
+      position: position || { x: 470 + count * 26, y: 330 + count * 18 },
       data: {
         kind,
         title: `${nodeMeta[kind].label} ${count}`,
@@ -693,7 +700,7 @@ function App() {
         ...(kind === 'code' ? { code: 'return { text: String(input ?? "") };' } : {}),
         ...(kind === 'aggregate' ? { aggregateStrategy: 'object' } : {}),
         ...(kind === 'output' ? { outputKey: `output_${count}` } : {}),
-        ...(kind === 'llm' ? { providerId: connection?.provider.id || '', model: connection?.model.id || '' } : {}),
+        ...(kind === 'llm' ? { providerId: connection?.provider.id || '', model: connection?.model.id || '', reasoningEffort: 'high' } : {}),
         ...(kind === 'image' ? { providerId: connection?.provider.id || '', model: connection?.model.id || '', imageSize: '1024x1024', imageQuality: 'high', imageCount: 1 } : {})
       }
     };
@@ -708,7 +715,7 @@ function App() {
       setToast('当前工作流已具备完整的生成链路');
       return;
     }
-    missing.forEach(addNode);
+    missing.forEach((kind) => addNode(kind));
     setToast(`已补全 ${missing.length} 个基础节点，请拖拽连接`);
   };
 
@@ -867,7 +874,7 @@ function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': connection.provider.apiKey },
             signal: controller.signal,
-            body: JSON.stringify({ prompt: upstreamText, system: node.data.prompt, baseUrl: connection.provider.baseUrl, model: connection.model.id, protocol: connection.model.protocol || 'chat-completions' })
+            body: JSON.stringify({ prompt: upstreamText, system: node.data.prompt, baseUrl: connection.provider.baseUrl, model: connection.model.id, protocol: connection.model.protocol || 'chat-completions', reasoningEffort: node.data.reasoningEffort || 'high' })
           });
           const data = await response.json();
           if (!response.ok) throw new NodeExecutionError(data.message || '基础模型调用失败', data.code || 'CHAT_REQUEST_FAILED', { requestId: data.requestId, httpStatus: response.status });
@@ -1061,10 +1068,10 @@ function App() {
           <button className={workspaceView === 'versions' ? 'active' : ''} onClick={() => setWorkspaceView('versions')}>版本</button>
         </nav>
         <div className="header-actions">
-          <button className="icon-button" aria-label="撤销" onClick={undo} disabled={!undoStack.length || running}><Undo2 size={17} /></button>
-          <button className="icon-button" aria-label="复制工作流 JSON" onClick={() => void copyWorkflow()}><ClipboardCopy size={17} /></button>
-          <button className="icon-button" aria-label="导出工作流" onClick={exportWorkflow}><FileDown size={17} /></button>
-          <button className="icon-button" aria-label="导入工作流" onClick={() => importWorkflowRef.current?.click()}><FileUp size={17} /></button>
+          <button className="icon-button header-tool" aria-label="撤销上一步" data-tooltip="撤销上一步" title="撤销上一步" onClick={undo} disabled={!undoStack.length || running}><Undo2 size={17} /></button>
+          <button className="icon-button header-tool" aria-label="复制工作流 JSON" data-tooltip="复制工作流 JSON" title="复制工作流 JSON" onClick={() => void copyWorkflow()}><ClipboardCopy size={17} /></button>
+          <button className="icon-button header-tool" aria-label="下载工作流文件" data-tooltip="下载工作流文件" title="下载工作流文件" onClick={exportWorkflow}><FileDown size={17} /></button>
+          <button className="icon-button header-tool" aria-label="导入工作流文件" data-tooltip="导入工作流文件" title="导入工作流文件" onClick={() => importWorkflowRef.current?.click()}><FileUp size={17} /></button>
           <input ref={importWorkflowRef} className="visually-hidden" type="file" accept="application/json,.json,.aiflow.json" onChange={(event) => { importWorkflow(event.target.files?.[0]); event.target.value = ''; }} />
           <button className="ghost-button" onClick={() => setWorkspaceView('models')}><Settings size={16} /> 模型服务</button>
           {running ? <button className="stop-button" onClick={stopWorkflow}><Square size={14} fill="currentColor" /> 停止运行</button> : <button className="run-button" onClick={runWorkflow}><Play size={16} fill="currentColor" />试运行</button>}
@@ -1079,6 +1086,7 @@ function App() {
             <button className="icon-button tiny" aria-label="折叠节点库" onClick={() => setLibraryOpen(false)}><Menu size={16} /></button>
           </div>
           <label className="search-box"><Search size={15} /><input value={nodeSearch} onChange={(event) => setNodeSearch(event.target.value)} placeholder="搜索节点" /></label>
+          <div className="library-drag-hint"><GripVertical size={13} /><span>拖拽到画布 · 单击快速添加</span></div>
           <button className="preset-launcher" onClick={() => setPresetOpen(true)}><LayoutTemplate size={16} /><span><strong>电商场景预设</strong><small>4 个可运行模板 · 多图多文案</small></span><ChevronDown size={14} /></button>
           <div className="node-groups">
             {['输入输出', 'AI 能力', '逻辑', '工具'].map((group) => {
@@ -1089,7 +1097,11 @@ function App() {
                 {kinds.map((kind) => {
                   const meta = nodeMeta[kind];
                   const Icon = meta.icon;
-                  return <button className="library-item" key={kind} onClick={() => addNode(kind)}>
+                  return <button className="library-item" key={kind} draggable title="拖拽到画布，或单击快速添加" onClick={() => addNode(kind)} onDragStart={(event) => {
+                    event.dataTransfer.setData('application/x-aiflow-node-kind', kind);
+                    event.dataTransfer.effectAllowed = 'copy';
+                    setDraggedLibraryKind(kind);
+                  }} onDragEnd={() => setDraggedLibraryKind(null)}>
                     <span className="library-icon" style={{ color: meta.color }}><Icon size={17} /></span>
                     <span><strong>{meta.label}</strong><small>{kind === 'llm' ? '对话、推理与结构化输出' : kind === 'image' ? '生成图片资产' : kind === 'http' ? '调用外部 API' : '工作流基础节点'}</small></span>
                     <Plus size={14} />
@@ -1104,13 +1116,25 @@ function App() {
         <section className="canvas-wrap">
           {workspaceView === 'editor' ? <>
           <div className="canvas-breadcrumb"><span>工作流</span><b>/</b><strong>{workflowTitle}</strong></div>
+          {draggedLibraryKind && <div className="canvas-drop-hint"><Plus size={14} />松开以添加「{nodeMeta[draggedLibraryKind].label}」</div>}
           <ReactFlow
+            className={draggedLibraryKind ? 'node-drop-active' : ''}
             nodes={nodes}
             edges={edges}
             nodeTypes={nodeTypes}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
             onConnect={onConnect}
+            onInit={(instance) => { reactFlowInstanceRef.current = instance; }}
+            onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; }}
+            onDrop={(event) => {
+              event.preventDefault();
+              const rawKind = event.dataTransfer.getData('application/x-aiflow-node-kind');
+              setDraggedLibraryKind(null);
+              if (!Object.prototype.hasOwnProperty.call(nodeMeta, rawKind) || !reactFlowInstanceRef.current) return;
+              addNode(rawKind as NodeKind, reactFlowInstanceRef.current.screenToFlowPosition({ x: event.clientX, y: event.clientY }));
+              setToast(`已添加${nodeMeta[rawKind as NodeKind].label}节点`);
+            }}
             onNodeClick={(_, node) => { setSelectedId(node.id); setConfigPanelOpen(true); }}
             onNodeDragStart={rememberSnapshot}
             fitView
@@ -1122,7 +1146,7 @@ function App() {
             <MiniMap nodeColor={(node) => nodeMeta[(node.data as FlowData).kind].color} maskColor="rgba(8,9,11,.82)" />
             <Controls showInteractive={false} />
           </ReactFlow>
-          <div className="canvas-status"><span className="live-dot" /> 自动保存已开启 <b>·</b> 画布可拖拽缩放</div>
+          <div className="canvas-status"><span className="live-dot" /> 自动保存已开启 <b>·</b> 节点可从左侧拖入</div>
           </> : workspaceView === 'models' ? <ProviderManager providers={providers} onSave={saveProvider} onDelete={deleteProvider} /> : workspaceView === 'runs' ? <div className="workspace-data-view">
             <header><div><strong>运行记录</strong><small>最近 {runRecords.length} 次工作流执行</small></div></header>
             {runRecords.length ? <div className="record-list">{runRecords.map((record) => <article key={record.id}><span className={`record-state ${record.status}`} /> <div><strong>{record.status === 'success' ? '运行成功' : record.status === 'partial' ? '部分成功' : record.status === 'cancelled' ? '用户停止' : '运行失败'}</strong><small>{new Date(record.startedAt).toLocaleString()} · {record.logs.length} 个节点</small></div><code>{record.duration}</code><button onClick={() => { setRunLogs(record.logs); setResult(record.result); setWorkspaceView('editor'); setDebugOpen(true); setActiveDebug(record.status === 'success' || record.status === 'partial' ? 'output' : 'logs'); }}>查看详情</button></article>)}</div> : <div className="data-empty"><TerminalSquare size={24} /><strong>暂无运行记录</strong><span>试运行工作流后会自动保存在这里</span></div>}
@@ -1174,6 +1198,13 @@ function App() {
               </label>
               <div className="credential-row"><KeyRound size={14} /><span>{selectedConnection?.provider.name || '尚未绑定供应商'}</span><b className={selectedConnection?.provider.apiKey ? 'ok' : ''}>{selectedConnection?.provider.apiKey ? `Key ••••${selectedConnection.provider.apiKey.slice(-4)}` : '未配置'}</b></div>
               {selectedNode.data.kind === 'llm' && <div className="credential-row"><Webhook size={14} /><span>文本请求接口</span><b className="ok">{selectedConnection?.model.protocol === 'responses' ? '/responses' : '/chat/completions'}</b></div>}
+              {selectedNode.data.kind === 'llm' && <label>思考强度
+                <select aria-label="思考强度" value={selectedNode.data.reasoningEffort || 'high'} onChange={(event) => updateSelected({ reasoningEffort: event.target.value as FlowData['reasoningEffort'] })}>
+                  <option value="low">低 · 更快</option>
+                  <option value="medium">中 · 均衡</option>
+                  <option value="high">高 · 深度思考（默认）</option>
+                </select>
+              </label>}
               <button className="variable-button" onClick={() => setWorkspaceView('models')}><Settings size={14} />管理供应商与模型</button>
             </div>}
             {selectedNode.data.kind === 'llm' && <div className="form-section">

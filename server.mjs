@@ -47,6 +47,11 @@ const requestChatProtocol = (value) => {
   if (value !== 'chat-completions' && value !== 'responses') throw new Error('文本接口协议仅支持 chat-completions 或 responses');
   return value;
 };
+const requestReasoningEffort = (value) => {
+  if (value === undefined || value === null || value === '') return 'high';
+  if (!['low', 'medium', 'high'].includes(value)) throw new Error('思考强度仅支持 low、medium 或 high');
+  return value;
+};
 const responseOutputText = (data) => {
   if (typeof data?.output_text === 'string') return data.output_text;
   if (!Array.isArray(data?.output)) return '';
@@ -83,7 +88,7 @@ app.post('/api/chat', async (req, res) => {
     return res.status(503).json({ code: 'CHAT_KEY_MISSING', message: '基础模型 Key 未配置', requestId: id });
   }
 
-  const { prompt, system, model, baseUrl: customBaseUrl, protocol, temperature } = req.body ?? {};
+  const { prompt, system, model, baseUrl: customBaseUrl, protocol, reasoningEffort, temperature } = req.body ?? {};
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ code: 'PROMPT_REQUIRED', message: '请输入提示词', requestId: id });
   }
@@ -91,10 +96,12 @@ app.post('/api/chat', async (req, res) => {
   let upstreamBaseUrl;
   let upstreamModel;
   let upstreamProtocol;
+  let upstreamReasoningEffort;
   try {
     upstreamBaseUrl = requestBaseUrl(customBaseUrl, chatBaseUrl);
     upstreamModel = requestModel(model, defaultChatModel);
     upstreamProtocol = requestChatProtocol(protocol);
+    upstreamReasoningEffort = requestReasoningEffort(reasoningEffort);
   } catch (error) {
     return res.status(400).json({ code: 'MODEL_CONFIG_INVALID', message: safeError(error), requestId: id });
   }
@@ -110,6 +117,7 @@ app.post('/api/chat', async (req, res) => {
         model: upstreamModel,
         input: prompt,
         ...(system ? { instructions: String(system) } : {}),
+        reasoning: { effort: upstreamReasoningEffort },
         ...(typeof temperature === 'number' ? { temperature } : {}),
         stream: false
       } : {
@@ -118,6 +126,7 @@ app.post('/api/chat', async (req, res) => {
           ...(system ? [{ role: 'system', content: String(system) }] : []),
           { role: 'user', content: prompt }
         ],
+        reasoning_effort: upstreamReasoningEffort,
         temperature: typeof temperature === 'number' ? temperature : 0.7,
         stream: false
       })
@@ -135,6 +144,7 @@ app.post('/api/chat', async (req, res) => {
       usage: data?.usage ?? null,
       model: data?.model || upstreamModel,
       protocol: upstreamProtocol,
+      reasoningEffort: upstreamReasoningEffort,
       requestId: id
     });
   } catch (error) {

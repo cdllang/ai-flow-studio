@@ -77,12 +77,13 @@ test('gateway forwards chat and image requests to separate browser-selected supp
     const chat = await fetch(`${origin}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': 'test-chat-key' },
-      body: JSON.stringify({ prompt: 'hello', baseUrl: chatBaseUrl, model: 'merchant-chat-v2' })
+      body: JSON.stringify({ prompt: 'hello', baseUrl: chatBaseUrl, model: 'merchant-chat-v2', reasoningEffort: 'low' })
     });
     assert.equal(chat.status, 200);
     const chatData = await chat.json();
     assert.equal(chatData.model, 'merchant-chat-v2');
     assert.equal(chatData.protocol, 'chat-completions');
+    assert.equal(chatData.reasoningEffort, 'low');
     assert.equal(chatData.text, 'custom chat ok');
 
     const responses = await fetch(`${origin}/api/chat`, {
@@ -94,6 +95,7 @@ test('gateway forwards chat and image requests to separate browser-selected supp
     const responsesData = await responses.json();
     assert.equal(responsesData.model, 'merchant-reasoner-v1');
     assert.equal(responsesData.protocol, 'responses');
+    assert.equal(responsesData.reasoningEffort, 'high');
     assert.equal(responsesData.text, 'custom responses ok');
     assert.equal(responsesData.usage.total_tokens, 9);
 
@@ -111,10 +113,12 @@ test('gateway forwards chat and image requests to separate browser-selected supp
     ]);
     assert.deepEqual(chatReceived[0].body.messages, [{ role: 'user', content: 'hello' }]);
     assert.equal(chatReceived[0].body.input, undefined);
+    assert.equal(chatReceived[0].body.reasoning_effort, 'low');
     assert.equal(chatReceived[0].body.temperature, 0.7);
     assert.equal(chatReceived[1].body.input, 'reason about this');
     assert.equal(chatReceived[1].body.instructions, 'be precise');
     assert.equal(chatReceived[1].body.messages, undefined);
+    assert.deepEqual(chatReceived[1].body.reasoning, { effort: 'high' });
     assert.equal(chatReceived[1].body.temperature, undefined);
     assert.deepEqual(imageReceived.map((item) => [item.url, item.body.model]), [
       ['/image-provider/v1/images/generations', 'merchant-image-v3']
@@ -135,6 +139,14 @@ test('gateway forwards chat and image requests to separate browser-selected supp
     });
     assert.equal(invalidProtocol.status, 400);
     assert.equal((await invalidProtocol.json()).code, 'MODEL_CONFIG_INVALID');
+
+    const invalidReasoning = await fetch(`${origin}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': 'test-chat-key' },
+      body: JSON.stringify({ prompt: 'hello', baseUrl: chatBaseUrl, model: 'chat', reasoningEffort: 'extreme' })
+    });
+    assert.equal(invalidReasoning.status, 400);
+    assert.equal((await invalidReasoning.json()).code, 'MODEL_CONFIG_INVALID');
   } finally {
     gateway.kill('SIGTERM');
     await close(chatUpstream);

@@ -6,6 +6,8 @@
 
 - 可拖拽的开始、大模型、图像生成、条件、HTTP、代码和结束节点
 - 节点选择、配置编辑、连接、缩放、小地图和运行状态
+- 左侧节点库支持单击快速添加，也支持拖到画布落点创建；拖拽过程提供落点反馈
+- 顶部纯图标操作提供悬停/键盘聚焦说明和无障碍名称
 - 节点删除、结构撤销、左右面板折叠、运行中止
 - 通用前端 DAG 执行器与条件节点 true/false 双出口
 - HTTP 请求节点：服务端代理、15 秒超时、私网 SSRF 拦截
@@ -13,6 +15,7 @@
 - 本地运行记录、版本发布与版本恢复
 - 800ms 防抖保存到浏览器 `localStorage`
 - 基础模型真实调用：同时兼容 OpenAI `/chat/completions` 与 `/responses`
+- 大模型节点支持低/中/高三档思考强度，默认 `high`；网关分别转换为 `reasoning_effort` 或 `reasoning.effort`
 - GPT Image 2 标准调用：OpenAI 兼容 `/images/generations`
 - 节点级运行日志、最终输出、错误状态和品牌演示素材回退
 - 独立“模型服务”页面：可新增多个供应商连接，并将 Base URL、API Key 与用户维护的模型清单成组保存
@@ -36,6 +39,7 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm verify:config
+pnpm verify:reasoning-drag
 pnpm verify:partial-failure
 pnpm verify:multi-output
 ```
@@ -73,7 +77,7 @@ docker compose up -d
 
 ## 配置
 
-启动后打开顶部“模型服务”，新增或编辑供应商连接。每条连接同时保存 Base URL、API Key 和此 Key 支持的模型清单，模型需标注为“文本模型”或“图像模型”。新增文本模型时还需选择 `Chat Completions · /chat/completions` 或 `Responses · /responses`；旧配置默认使用 Chat Completions。回到编排页后，在每个大模型/图像节点中选择对应供应商连接与模型。
+启动后打开顶部“模型服务”，新增或编辑供应商连接。每条连接同时保存 Base URL、API Key 和此 Key 支持的模型清单，模型需标注为“文本模型”或“图像模型”。新增文本模型时还需选择 `Chat Completions · /chat/completions` 或 `Responses · /responses`；旧配置默认使用 Chat Completions。回到编排页后，在每个大模型节点中选择供应商、模型与思考强度，在图像节点中选择供应商和模型。
 
 文字和图像请求只携带该节点绑定连接的 Base URL、API Key 与模型。旧版浏览器中的基础模型/图像模型配置会自动迁移为两条供应商连接。正式生产建议将浏览器凭证迁移到 Secret Manager。
 

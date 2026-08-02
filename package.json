@@ -16,7 +16,8 @@
     "verify:ratios": "node scripts/verify-ratios.mjs",
     "verify:preview": "node scripts/verify-image-preview.mjs",
     "verify:multi-output": "node scripts/verify-multi-output.mjs",
-    "verify:partial-failure": "node scripts/verify-partial-failure.mjs"
+    "verify:partial-failure": "node scripts/verify-partial-failure.mjs",
+    "verify:reasoning-drag": "node scripts/verify-reasoning-drag.mjs"
   },
   "dependencies": {
     "@xyflow/react": "^12.9.2",

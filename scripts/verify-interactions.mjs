@@ -26,6 +26,12 @@ attachDiagnostics(page);
 await mockConfigured(page);
 await page.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
 
+const tooltipDescriptions = await page.locator('.header-actions .header-tool').evaluateAll((buttons) => buttons.map((button) => button.getAttribute('data-tooltip')));
+const headerTooltips = JSON.stringify(tooltipDescriptions) === JSON.stringify(['撤销上一步', '复制工作流 JSON', '下载工作流文件', '导入工作流文件']);
+await page.locator('.header-actions .header-tool').nth(1).hover();
+await page.waitForTimeout(180);
+const headerTooltipVisible = await page.locator('.header-actions .header-tool').nth(1).evaluate((button) => getComputedStyle(button, '::after').opacity === '1');
+
 await page.getByRole('button', { name: '折叠节点库' }).click();
 const libraryCollapsed = await page.getByRole('button', { name: '展开节点库' }).isVisible();
 await page.getByRole('button', { name: '展开节点库' }).click();
@@ -34,6 +40,12 @@ const configCollapsed = await page.getByRole('button', { name: '展开配置' })
 await page.getByRole('button', { name: '展开配置' }).click();
 
 const initialNodeCount = await page.locator('.flow-node').count();
+const libraryDragHint = await page.getByText('拖拽到画布 · 单击快速添加').isVisible();
+await page.locator('.library-item').filter({ hasText: '大模型' }).dragTo(page.locator('.react-flow__pane'), { targetPosition: { x: 520, y: 330 } });
+await page.waitForTimeout(150);
+const nodeDragged = await page.locator('.flow-node').count() === initialNodeCount + 1;
+await page.locator('.flow-node').last().getByRole('button', { name: '节点菜单' }).click();
+await page.locator('.flow-node').last().getByRole('button', { name: '删除节点' }).click();
 await page.locator('.library-item').filter({ hasText: '代码' }).click();
 const nodeAdded = await page.locator('.flow-node').count() === initialNodeCount + 1;
 await page.locator('.flow-node').last().getByRole('button', { name: '节点菜单' }).click();
@@ -136,8 +148,12 @@ await httpPage.getByText(/HTTP_NODE_OK/).waitFor();
 const httpNodeExecuted = await httpPage.getByText(/HTTP_NODE_OK/).isVisible();
 
 console.log(JSON.stringify({
+  headerTooltips,
+  headerTooltipVisible,
   libraryCollapsed,
   configCollapsed,
+  libraryDragHint,
+  nodeDragged,
   nodeAdded,
   nodeDeleted,
   undoRestored,
@@ -152,5 +168,7 @@ console.log(JSON.stringify({
   consoleProblems,
   pageErrors
 }, null, 2));
+
+if (!headerTooltips || !headerTooltipVisible || !libraryCollapsed || !configCollapsed || !libraryDragHint || !nodeDragged || !nodeAdded || !nodeDeleted || !undoRestored || !variableInserted || !versionPublished || !versionRestored || !trueBranchExecuted || !falseBranchSkipped || !runRecordCreated || !stopSucceeded || !httpNodeExecuted || consoleProblems.length || pageErrors.length) process.exitCode = 1;
 
 await browser.close();
