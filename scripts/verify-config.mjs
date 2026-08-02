@@ -77,7 +77,7 @@ await page.locator('.flow-node').filter({ hasText: '生成视觉方案' }).click
 await page.getByRole('combobox', { name: '节点供应商连接' }).selectOption({ label: '双能力供应商' });
 await page.getByRole('combobox', { name: '节点模型 ID' }).selectOption('vendor-chat-pro');
 const reasoningDefaultsHigh = await page.getByRole('combobox', { name: '思考强度' }).inputValue() === 'high';
-await page.getByRole('combobox', { name: '思考强度' }).selectOption('low');
+await page.getByRole('combobox', { name: '思考强度' }).selectOption('max');
 await page.locator('.flow-node').filter({ hasText: '生成主视觉' }).click();
 await page.getByRole('combobox', { name: '节点供应商连接' }).selectOption({ label: '双能力供应商' });
 await page.getByRole('combobox', { name: '节点模型 ID' }).selectOption('vendor-image-pro');
@@ -99,7 +99,7 @@ const result = {
     && request.body.baseUrl === 'https://vendor.example.com/openai/v1'
     && request.body.model === 'vendor-chat-pro'
     && request.body.protocol === 'responses'
-    && request.body.reasoningEffort === 'low'),
+    && request.body.reasoningEffort === 'max'),
   imageNodeUsesSelectedProvider: requests.some((request) => request.type === 'image'
     && request.key === 'vendor-combined-key'
     && request.body.baseUrl === 'https://vendor.example.com/openai/v1'

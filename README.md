@@ -15,7 +15,7 @@
 - 本地运行记录、版本发布与版本恢复
 - 800ms 防抖保存到浏览器 `localStorage`
 - 基础模型真实调用：同时兼容 OpenAI `/chat/completions` 与 `/responses`
-- 大模型节点支持低/中/高三档思考强度，默认 `high`；网关分别转换为 `reasoning_effort` 或 `reasoning.effort`
+- 大模型节点支持 `low / medium / high / xhigh / max` 五档思考强度，默认 `high`；网关分别转换为 `reasoning_effort` 或 `reasoning.effort`
 - GPT Image 2 标准调用：OpenAI 兼容 `/images/generations`
 - 节点级运行日志、最终输出、错误状态和品牌演示素材回退
 - 独立“模型服务”页面：可新增多个供应商连接，并将 Base URL、API Key 与用户维护的模型清单成组保存

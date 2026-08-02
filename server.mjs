@@ -49,7 +49,7 @@ const requestChatProtocol = (value) => {
 };
 const requestReasoningEffort = (value) => {
   if (value === undefined || value === null || value === '') return 'high';
-  if (!['low', 'medium', 'high'].includes(value)) throw new Error('思考强度仅支持 low、medium 或 high');
+  if (!['low', 'medium', 'high', 'xhigh', 'max'].includes(value)) throw new Error('思考强度仅支持 low、medium、high、xhigh 或 max');
   return value;
 };
 const responseOutputText = (data) => {

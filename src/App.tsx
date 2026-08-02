@@ -95,7 +95,7 @@ type FlowData = Record<string, unknown> & {
   prompt?: string;
   providerId?: string;
   model?: string;
-  reasoningEffort?: 'low' | 'medium' | 'high';
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   conditionSource?: 'input' | 'upstream';
   conditionOperator?: 'contains' | 'not_contains' | 'equals' | 'not_equals';
   conditionValue?: string;
@@ -1203,6 +1203,8 @@ function App() {
                   <option value="low">低 · 更快</option>
                   <option value="medium">中 · 均衡</option>
                   <option value="high">高 · 深度思考（默认）</option>
+                  <option value="xhigh">极高 · 更深度推理</option>
+                  <option value="max">最高 · 质量优先</option>
                 </select>
               </label>}
               <button className="variable-button" onClick={() => setWorkspaceView('models')}><Settings size={14} />管理供应商与模型</button>

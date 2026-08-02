@@ -77,13 +77,13 @@ test('gateway forwards chat and image requests to separate browser-selected supp
     const chat = await fetch(`${origin}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': 'test-chat-key' },
-      body: JSON.stringify({ prompt: 'hello', baseUrl: chatBaseUrl, model: 'merchant-chat-v2', reasoningEffort: 'low' })
+      body: JSON.stringify({ prompt: 'hello', baseUrl: chatBaseUrl, model: 'merchant-chat-v2', reasoningEffort: 'max' })
     });
     assert.equal(chat.status, 200);
     const chatData = await chat.json();
     assert.equal(chatData.model, 'merchant-chat-v2');
     assert.equal(chatData.protocol, 'chat-completions');
-    assert.equal(chatData.reasoningEffort, 'low');
+    assert.equal(chatData.reasoningEffort, 'max');
     assert.equal(chatData.text, 'custom chat ok');
 
     const responses = await fetch(`${origin}/api/chat`, {
@@ -113,7 +113,7 @@ test('gateway forwards chat and image requests to separate browser-selected supp
     ]);
     assert.deepEqual(chatReceived[0].body.messages, [{ role: 'user', content: 'hello' }]);
     assert.equal(chatReceived[0].body.input, undefined);
-    assert.equal(chatReceived[0].body.reasoning_effort, 'low');
+    assert.equal(chatReceived[0].body.reasoning_effort, 'max');
     assert.equal(chatReceived[0].body.temperature, 0.7);
     assert.equal(chatReceived[1].body.input, 'reason about this');
     assert.equal(chatReceived[1].body.instructions, 'be precise');

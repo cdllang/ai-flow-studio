@@ -10,7 +10,7 @@ const probe = net.createServer();
 const port = await listen(probe);
 await close(probe);
 
-const screenshotDir = path.resolve('.verification');
+const screenshotDir = path.resolve(process.env.VERIFY_SCREENSHOT_DIR || '.verification');
 fs.mkdirSync(screenshotDir, { recursive: true });
 const staticDir = path.resolve(process.env.VERIFY_STATIC_DIR || 'dist');
 const gateway = spawn(process.execPath, ['server.mjs'], {
@@ -66,18 +66,20 @@ try {
 
   await page.goto(origin, { waitUntil: 'networkidle' });
   await page.locator('.flow-node').filter({ hasText: '推理节点' }).click();
-  const reasoningDefaultsHigh = await page.getByRole('combobox', { name: '思考强度' }).inputValue() === 'high';
-  await page.getByRole('combobox', { name: '思考强度' }).selectOption('low');
+  const reasoningSelect = page.getByRole('combobox', { name: '思考强度' });
+  const reasoningDefaultsHigh = await reasoningSelect.inputValue() === 'high';
+  const reasoningOptionsCoverLowToMax = await reasoningSelect.locator('option').evaluateAll((options) => options.map((option) => option.value).join(',')) === 'low,medium,high,xhigh,max';
+  await reasoningSelect.selectOption('max');
   await page.getByRole('button', { name: '试运行' }).click();
   await page.getByText('reasoning ok').waitFor({ timeout: 10_000 });
-  const reasoningRequestForwarded = chatRequests.some((request) => request.protocol === 'responses' && request.reasoningEffort === 'low');
+  const reasoningRequestForwarded = chatRequests.some((request) => request.protocol === 'responses' && request.reasoningEffort === 'max');
 
   const tooltipDescriptions = await page.locator('.header-actions .header-tool').evaluateAll((buttons) => buttons.map((button) => button.getAttribute('data-tooltip')));
   const headerTooltips = JSON.stringify(tooltipDescriptions) === JSON.stringify(['撤销上一步', '复制工作流 JSON', '下载工作流文件', '导入工作流文件']);
   await page.locator('.header-actions .header-tool').nth(1).hover();
   await page.waitForTimeout(180);
   const headerTooltipVisible = await page.locator('.header-actions .header-tool').nth(1).evaluate((button) => getComputedStyle(button, '::after').opacity === '1');
-  await page.screenshot({ path: path.join(screenshotDir, 'reasoning-and-header-tooltips.png'), fullPage: true });
+  await page.screenshot({ path: path.join(screenshotDir, 'reasoning-and-header-tooltips-v2.png'), fullPage: true });
 
   const initialNodeCount = await page.locator('.flow-node').count();
   const libraryDragHint = await page.getByText('拖拽到画布 · 单击快速添加').isVisible();
@@ -88,6 +90,7 @@ try {
 
   const result = {
     reasoningDefaultsHigh,
+    reasoningOptionsCoverLowToMax,
     reasoningRequestForwarded,
     headerTooltips,
     headerTooltipVisible,
