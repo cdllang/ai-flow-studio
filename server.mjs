@@ -4,6 +4,20 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { composeSkillInstructions, listPublicSkills, loadSkillRegistry, resolveLocalSkills, resolveSkills } from './skill-registry.mjs';
+import { loadWorkflowAssistantSkill } from './system-skill-loader.mjs';
+import {
+  addSessionTurn,
+  applySessionCompression,
+  extractJsonObject,
+  maxAssistantRepairAttempts,
+  normalizeAssistantEnvelope,
+  normalizeAssistantSession,
+  normalizeTaskContract,
+  publicAssistantProviderCatalog,
+  shouldCompressSession,
+  validateWorkflowDraft,
+  validationReport
+} from './workflow-assistant-core.mjs';
 
 dotenv.config({ path: '.env.local', override: false });
 
@@ -11,6 +25,8 @@ const app = express();
 const root = path.dirname(fileURLToPath(import.meta.url));
 const skillsDirectory = path.resolve(root, process.env.SKILLS_DIR || 'skills');
 const skillRegistry = loadSkillRegistry(skillsDirectory);
+const systemSkillsDirectory = path.resolve(root, process.env.SYSTEM_SKILLS_DIR || 'system-skills');
+const workflowAssistantSkill = loadWorkflowAssistantSkill(systemSkillsDirectory);
 const port = Number(process.env.PORT || 14590);
 const host = process.env.HOST || '0.0.0.0';
 const baseUrl = (process.env.AIWANAI_BASE_URL || 'https://ai.aiwanai.com.cn/v1').replace(/\/$/, '');
@@ -63,6 +79,48 @@ const responseOutputText = (data) => {
     .filter(Boolean)
     .join('\n');
 };
+class TextModelError extends Error {
+  constructor(message, code, status = 502, upstreamRequestId = '') {
+    super(message);
+    this.name = 'TextModelError';
+    this.code = code;
+    this.status = status;
+    this.upstreamRequestId = upstreamRequestId;
+  }
+}
+const callTextModel = async ({ apiKey, baseUrl: upstreamBaseUrl, model, protocol, reasoningEffort, system, prompt, temperature }) => {
+  let response;
+  try {
+    response = await fetch(`${upstreamBaseUrl}/${protocol === 'responses' ? 'responses' : 'chat/completions'}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(90_000),
+      body: JSON.stringify(protocol === 'responses' ? {
+        model,
+        input: prompt,
+        ...(system ? { instructions: system } : {}),
+        reasoning: { effort: reasoningEffort },
+        ...(typeof temperature === 'number' ? { temperature } : {}),
+        stream: false
+      } : {
+        model,
+        messages: [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: prompt }],
+        reasoning_effort: reasoningEffort,
+        temperature: typeof temperature === 'number' ? temperature : 0.2,
+        stream: false
+      })
+    });
+  } catch (error) {
+    throw new TextModelError(safeError(error), 'ASSISTANT_MODEL_NETWORK_ERROR', 502);
+  }
+  const data = await response.json().catch(() => ({}));
+  const upstreamRequestId = response.headers.get('x-request-id') || data?.request_id || '';
+  if (!response.ok) throw new TextModelError(data?.error?.message || `模型服务返回 ${response.status}`, 'ASSISTANT_MODEL_UPSTREAM_ERROR', response.status, upstreamRequestId);
+  const output = protocol === 'responses' ? responseOutputText(data) : data?.choices?.[0]?.message?.content ?? '';
+  if (typeof output !== 'string' || !output.trim()) throw new TextModelError('模型返回了空内容', 'ASSISTANT_MODEL_EMPTY_RESPONSE', 502, upstreamRequestId);
+  return { text: output, usage: data?.usage ?? null, model: data?.model || model, upstreamRequestId };
+};
+const redactSecrets = (value) => JSON.parse(JSON.stringify(value ?? null).replace(/sk-[A-Za-z0-9_-]{16,}/gi, '[REDACTED]').replace(/bearer\s+[A-Za-z0-9._-]{20,}/gi, 'Bearer [REDACTED]'));
 const publicConfig = () => ({
   baseUrl,
   chatBaseUrl,
@@ -86,6 +144,206 @@ app.get('/api/config/status', (_req, res) => {
 
 app.get('/api/skills', (_req, res) => {
   res.set('Cache-Control', 'no-store').json({ schemaVersion: 1, skills: listPublicSkills(skillRegistry) });
+});
+
+app.post('/api/workflow-assistant/turn', async (req, res) => {
+  const id = requestId();
+  const chatApiKey = requestApiKey(req);
+  if (!chatApiKey) return res.status(503).json({ code: 'CHAT_KEY_MISSING', message: '请先为 AI 工作流助手选择已配置 API Key 的文本模型', requestId: id });
+
+  const body = req.body ?? {};
+  const message = typeof body.message === 'string' ? body.message.trim() : '';
+  if (!message || message.length > 20_000) return res.status(400).json({ code: 'ASSISTANT_MESSAGE_INVALID', message: 'Session 消息不能为空且不能超过 20000 个字符', requestId: id });
+
+  let builder;
+  let critic;
+  try {
+    const provider = body.provider && typeof body.provider === 'object' ? body.provider : {};
+    builder = {
+      id: typeof provider.id === 'string' ? provider.id.slice(0, 100) : '',
+      baseUrl: requestBaseUrl(provider.baseUrl, chatBaseUrl),
+      model: requestModel(provider.model, defaultChatModel),
+      protocol: requestChatProtocol(provider.protocol),
+      reasoningEffort: requestReasoningEffort(provider.reasoningEffort),
+      contextWindow: Number.isFinite(provider.contextWindow) ? Math.max(4_096, Math.min(Number(provider.contextWindow), 2_000_000)) : 128_000,
+      apiKey: chatApiKey
+    };
+    const criticProvider = body.criticProvider && typeof body.criticProvider === 'object' ? body.criticProvider : null;
+    const criticApiKey = typeof req.get('x-aiflow-critic-key') === 'string' && req.get('x-aiflow-critic-key').length <= 4096 ? req.get('x-aiflow-critic-key').trim() : chatApiKey;
+    critic = criticProvider ? {
+      id: typeof criticProvider.id === 'string' ? criticProvider.id.slice(0, 100) : '',
+      baseUrl: requestBaseUrl(criticProvider.baseUrl, chatBaseUrl),
+      model: requestModel(criticProvider.model, defaultChatModel),
+      protocol: requestChatProtocol(criticProvider.protocol),
+      reasoningEffort: requestReasoningEffort(criticProvider.reasoningEffort),
+      apiKey: criticApiKey || chatApiKey
+    } : { ...builder, apiKey: chatApiKey };
+  } catch (error) {
+    return res.status(400).json({ code: 'MODEL_CONFIG_INVALID', message: safeError(error), requestId: id });
+  }
+
+  const providerCatalog = publicAssistantProviderCatalog(body.providers);
+  const currentWorkflow = redactSecrets(body.currentWorkflow && typeof body.currentWorkflow === 'object' ? body.currentWorkflow : null);
+  let session = normalizeAssistantSession(body.session, { providerId: builder.id, modelId: builder.model, currentWorkflowRevision: body.currentWorkflowRevision });
+  session.providerId = builder.id;
+  session.modelId = builder.model;
+  session.currentWorkflowRevision = typeof body.currentWorkflowRevision === 'string' ? body.currentWorkflowRevision.slice(0, 200) : session.currentWorkflowRevision;
+  session = addSessionTurn(session, 'user', message);
+
+  const requestedPermissions = body.permissions && typeof body.permissions === 'object' ? body.permissions : session.contract.constraints;
+  const authoritativeConstraints = {
+    allowHttp: requestedPermissions.allowHttp === true,
+    allowCode: requestedPermissions.allowCode === true,
+    maxModelCalls: Number.isInteger(requestedPermissions.maxModelCalls) ? Math.max(0, Math.min(requestedPermissions.maxModelCalls, 40)) : 8,
+    maxImageCalls: Number.isInteger(requestedPermissions.maxImageCalls) ? Math.max(0, Math.min(requestedPermissions.maxImageCalls, 20)) : 4
+  };
+  const stages = [];
+  let compression = { attempted: false, compressed: false, estimatedTokens: 0, threshold: 0 };
+
+  const contextForBuilder = () => ({
+    session: {
+      id: session.id,
+      phase: session.phase,
+      contract: session.contract,
+      summary: session.summary,
+      recentTurns: session.recentTurns,
+      currentWorkflowRevision: session.currentWorkflowRevision,
+      repairAttempt: session.repairAttempt
+    },
+    currentWorkflow,
+    providers: providerCatalog,
+    availableNodeKinds: ['start', 'llm', 'image', 'condition', 'http', 'code', 'aggregate', 'output'],
+    permissions: authoritativeConstraints,
+    latestMessage: message
+  });
+
+  const initialCompressionCheck = shouldCompressSession(session, { skill: workflowAssistantSkill.builder, contracts: workflowAssistantSkill.contracts, context: contextForBuilder() }, builder.contextWindow);
+  compression = { ...compression, estimatedTokens: initialCompressionCheck.estimatedTokens, threshold: initialCompressionCheck.threshold };
+  if (initialCompressionCheck.shouldCompress) {
+    compression.attempted = true;
+    const sourceTurns = session.recentTurns.slice(0, -6);
+    if (!sourceTurns.length) {
+      session.phase = 'blocked';
+      session = addSessionTurn(session, 'assistant', '当前工作流和契约已超过模型上下文预算，且没有可安全压缩的旧消息。请缩小当前工作流或新建 Session。', 'blocked');
+      return res.status(413).json({ code: 'ASSISTANT_CONTEXT_TOO_LARGE', message: '上下文超过安全预算且无法压缩', session, compression, stages, requestId: id });
+    }
+    const sourceTurnIds = sourceTurns.map((turn) => turn.id);
+    let compressionError = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      stages.push({ stage: 'compression', status: 'running', detail: `正在压缩较早上下文 · 第 ${attempt} 次` });
+      try {
+        const response = await callTextModel({
+          ...builder,
+          system: `${workflowAssistantSkill.memory}\n\nReturn one JSON object with confirmedDecisions, rejectedAlternatives, assumptions, pendingQuestions, appliedRevisions, terminology, and sourceTurnIds. Preserve every supplied source turn id.`,
+          prompt: JSON.stringify({ priorSummary: session.summary, sourceTurns, contract: session.contract, currentWorkflowRevision: session.currentWorkflowRevision })
+        });
+        const summary = extractJsonObject(response.text);
+        if (!Array.isArray(summary.sourceTurnIds) || sourceTurnIds.some((turnId) => !summary.sourceTurnIds.includes(turnId))) throw new Error('压缩摘要未覆盖所有来源消息');
+        session = applySessionCompression(session, summary, sourceTurnIds);
+        compression = { ...compression, compressed: true, sourceTurns: sourceTurnIds.length, retainedTurns: session.recentTurns.length };
+        stages[stages.length - 1] = { stage: 'compression', status: 'success', detail: `已压缩 ${sourceTurnIds.length} 条旧消息，保留最近 ${session.recentTurns.length} 条` };
+        compressionError = null;
+        break;
+      } catch (error) {
+        compressionError = error;
+        stages[stages.length - 1] = { stage: 'compression', status: 'error', detail: safeError(error) };
+      }
+    }
+    if (compressionError) {
+      session.phase = 'blocked';
+      session = addSessionTurn(session, 'assistant', '上下文压缩连续两次未通过完整性检查。为避免丢失已确认边界，本 Session 已暂停。', 'blocked');
+      return res.status(422).json({ code: 'SESSION_COMPRESSION_FAILED', message: safeError(compressionError), session, compression, stages, requestId: id });
+    }
+  }
+
+  const applyAuthoritativeConstraints = (contract) => ({ ...normalizeTaskContract(contract), constraints: { ...normalizeTaskContract(contract).constraints, ...authoritativeConstraints } });
+  const builderSystem = `${workflowAssistantSkill.builder}\n\n${workflowAssistantSkill.contracts}\n\nYou are the Builder entrypoint. Return exactly one JSON AssistantTurn object and no markdown. Use only the supplied node, provider, and model catalogs. Every draft node status must be idle.`;
+  let envelope;
+  try {
+    session.phase = 'drafting';
+    stages.push({ stage: 'intent', status: 'running', detail: '系统 Skill 正在确认目标、边界与验收标准' });
+    const builderResponse = await callTextModel({ ...builder, system: builderSystem, prompt: JSON.stringify(contextForBuilder()) });
+    envelope = normalizeAssistantEnvelope(extractJsonObject(builderResponse.text));
+    envelope.contract = applyAuthoritativeConstraints(envelope.contract);
+    stages[stages.length - 1] = { stage: 'intent', status: 'success', detail: envelope.status === 'needs_clarification' ? `需要补充 ${envelope.questions.length} 项信息` : '任务契约已生成' };
+  } catch (error) {
+    const status = error instanceof TextModelError ? error.status : 502;
+    return res.status(status).json({ code: error.code || 'ASSISTANT_BUILDER_INVALID', message: safeError(error), requestId: id, upstreamRequestId: error.upstreamRequestId || '', session, stages });
+  }
+
+  session.contract = envelope.contract;
+  if (envelope.status !== 'draft_ready') {
+    session.phase = envelope.status === 'blocked' ? 'blocked' : 'discovery';
+    session = addSessionTurn(session, 'assistant', [envelope.message, ...envelope.questions].join('\n'), envelope.status);
+    return res.set('Cache-Control', 'no-store').json({ schemaVersion: 1, response: envelope, session, stages, compression, systemSkill: { id: workflowAssistantSkill.id, version: workflowAssistantSkill.version, autoApplied: true }, requestId: id });
+  }
+
+  let candidateDraft = envelope.draft;
+  let report = validationReport({ valid: false, issues: [] }, [], 0);
+  let repairAttempt = 0;
+  while (repairAttempt <= maxAssistantRepairAttempts) {
+    session.phase = 'validating';
+    stages.push({ stage: 'deterministic_validation', status: 'running', detail: '正在检查 Schema、图结构、权限、模型引用、Secret 与预算' });
+    const deterministic = validateWorkflowDraft(candidateDraft, { providers: providerCatalog, constraints: authoritativeConstraints });
+    stages[stages.length - 1] = { stage: 'deterministic_validation', status: deterministic.valid ? 'success' : 'error', detail: deterministic.valid ? '确定性检查全部通过' : `发现 ${deterministic.issues.length} 个结构问题` };
+
+    let criticIssues = [];
+    if (deterministic.valid) {
+      stages.push({ stage: 'critic', status: 'running', detail: critic.id && critic.id !== builder.id ? '正在使用独立审查模型检查需求覆盖' : '正在使用隔离上下文 Critic 检查需求覆盖' });
+      try {
+        const criticResponse = await callTextModel({
+          ...critic,
+          system: `${workflowAssistantSkill.critic}\n\n${workflowAssistantSkill.contracts}`,
+          prompt: JSON.stringify({ contract: envelope.contract, candidateDraft, currentWorkflow, deterministicFacts: deterministic, providers: providerCatalog })
+        });
+        const criticResult = extractJsonObject(criticResponse.text);
+        criticIssues = Array.isArray(criticResult.issues) ? criticResult.issues : [];
+        if (criticResult.passed !== true && !criticIssues.some((entry) => entry?.severity === 'error')) criticIssues.push({ severity: 'error', code: 'CRITIC_REJECTED_WITHOUT_DETAILS', message: 'Critic 拒绝草案但未提供有效证据' });
+        const criticPassed = criticResult.passed === true && !criticIssues.some((entry) => entry?.severity === 'error');
+        stages[stages.length - 1] = { stage: 'critic', status: criticPassed ? 'success' : 'error', detail: criticPassed ? '语义覆盖检查通过' : `Critic 发现 ${criticIssues.length} 个问题` };
+      } catch (error) {
+        criticIssues = [{ severity: 'error', code: error.code || 'CRITIC_RESPONSE_INVALID', message: safeError(error), evidence: error.upstreamRequestId || '' }];
+        stages[stages.length - 1] = { stage: 'critic', status: 'error', detail: safeError(error) };
+      }
+    }
+    report = validationReport(deterministic, criticIssues, repairAttempt);
+    if (report.valid) break;
+    if (repairAttempt >= maxAssistantRepairAttempts) break;
+
+    repairAttempt += 1;
+    session.phase = 'repairing';
+    stages.push({ stage: 'repair', status: 'running', detail: `正在进行第 ${repairAttempt}/${maxAssistantRepairAttempts} 轮受限修复` });
+    try {
+      const repairResponse = await callTextModel({
+        ...builder,
+        system: `${workflowAssistantSkill.builder}\n\n${workflowAssistantSkill.contracts}\n\nYou are the Repair entrypoint. Return one complete draft_ready AssistantTurn JSON object. Preserve the contract and change only allow-listed workflow draft fields. Never change permissions, provider credentials, schema version, validation state, or repair counters.`,
+        prompt: JSON.stringify({ contract: envelope.contract, candidateDraft, validation: report, currentWorkflow, providers: providerCatalog, permissions: authoritativeConstraints })
+      });
+      const repaired = normalizeAssistantEnvelope(extractJsonObject(repairResponse.text));
+      if (repaired.status !== 'draft_ready' || !repaired.draft) throw new Error('修复模型未返回完整草案');
+      candidateDraft = repaired.draft;
+      envelope.message = repaired.message;
+      stages[stages.length - 1] = { stage: 'repair', status: 'success', detail: `第 ${repairAttempt} 轮修复已生成，重新执行全部检查` };
+    } catch (error) {
+      stages[stages.length - 1] = { stage: 'repair', status: 'error', detail: safeError(error) };
+      report = { ...report, valid: false, issues: [...report.issues, { source: 'critic', severity: 'error', code: error.code || 'REPAIR_RESPONSE_INVALID', message: safeError(error) }] };
+      break;
+    }
+  }
+
+  session.repairAttempt = repairAttempt;
+  session.candidateDraft = candidateDraft;
+  session.validation = report;
+  if (report.valid) {
+    session.phase = 'awaiting_confirmation';
+    envelope = { ...envelope, status: 'draft_ready', draft: candidateDraft, validation: report };
+    session = addSessionTurn(session, 'assistant', envelope.message || '草案已通过全部检查，等待确认应用。', 'draft_ready');
+  } else {
+    session.phase = 'blocked';
+    envelope = { ...envelope, status: 'blocked', message: `草案在 ${repairAttempt} 轮修复后仍未通过严格校验，未修改当前画布。`, draft: candidateDraft, validation: report };
+    session = addSessionTurn(session, 'assistant', envelope.message, 'blocked');
+  }
+  return res.set('Cache-Control', 'no-store').json({ schemaVersion: 1, response: envelope, session, stages, compression, systemSkill: { id: workflowAssistantSkill.id, version: workflowAssistantSkill.version, autoApplied: true }, requestId: id });
 });
 
 app.post('/api/chat', async (req, res) => {

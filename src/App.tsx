@@ -61,6 +61,15 @@ import {
 import { OutputPanel } from './components/OutputPanel';
 import { ProviderManager } from './components/ProviderManager';
 import { SkillManager } from './components/SkillManager';
+import { WorkflowAssistant } from './components/WorkflowAssistant';
+import {
+  assistantSessionStorageKey,
+  createWorkflowAssistantSession,
+  loadStoredAssistantSession,
+  workflowRevision,
+  type WorkflowAssistantDraft,
+  type WorkflowAssistantSession
+} from './assistantSession';
 import {
   legacyCredentialStorageKey,
   normalizeProviderStore,
@@ -477,10 +486,13 @@ function BrandMark() {
 function App() {
   const savedWorkflow = useMemo(loadSavedWorkflow, []);
   const initialProviders = useMemo(loadStoredProviders, []);
+  const initialAssistantConnection = useMemo(() => resolveNodeProvider(initialProviders, 'chat'), [initialProviders]);
   const [providers, setProviders] = useState<ModelProvider[]>(initialProviders);
   const [skillCatalog, setSkillCatalog] = useState<SkillSummary[]>([]);
   const [localSkills, setLocalSkills] = useState<LocalSkillDefinition[]>(loadStoredLocalSkills);
   const [skillCatalogStatus, setSkillCatalogStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [assistantSession, setAssistantSession] = useState<WorkflowAssistantSession>(() => loadStoredAssistantSession() || createWorkflowAssistantSession(initialAssistantConnection?.provider.id, initialAssistantConnection?.model.id));
   const [nodes, setNodes] = useState<Node<FlowData>[]>(() => syncNodeProviders(savedWorkflow?.nodes ?? initialNodes, initialProviders));
   const [edges, setEdges] = useState<Edge[]>(savedWorkflow?.edges ?? initialEdges);
   const [selectedId, setSelectedId] = useState<string>('llm-1');
@@ -518,6 +530,11 @@ function App() {
   const selectedSkillIds = selectedNode?.data.kind === 'llm' ? normalizeNodeSkillIds(selectedNode.data.skillIds) : [];
   const llmSkills = [...skillCatalog, ...localSkills].filter((skill) => skill.nodeKinds.includes('llm'));
   const missingSelectedSkillIds = selectedSkillIds.filter((skillId) => !llmSkills.some((skill) => skill.id === skillId));
+  const assistantWorkflow = useMemo(() => {
+    const snapshot = cleanSnapshot(nodes, edges);
+    return { title: workflowTitle, input, nodes: snapshot.nodes, edges: snapshot.edges };
+  }, [nodes, edges, workflowTitle, input]);
+  const assistantWorkflowRevision = useMemo(() => workflowRevision(assistantWorkflow), [assistantWorkflow]);
 
   useEffect(() => {
     localStorage.setItem(providerStorageKey, JSON.stringify({ schemaVersion: 1, providers }));
@@ -527,6 +544,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem(localSkillStorageKey, JSON.stringify({ schemaVersion: 1, skills: localSkills }));
   }, [localSkills]);
+
+  useEffect(() => {
+    localStorage.setItem(assistantSessionStorageKey, JSON.stringify(assistantSession));
+  }, [assistantSession]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -784,13 +805,35 @@ function App() {
   };
 
   const completeSuggestedWorkflow = () => {
-    const missing = (['start', 'llm', 'image', 'output'] as NodeKind[]).filter((kind) => !nodes.some((node) => node.data.kind === kind));
-    if (!missing.length) {
-      setToast('当前工作流已具备完整的生成链路');
+    if (!providersForCapability(providers, 'chat').some((provider) => provider.apiKey)) {
+      setWorkspaceView('models');
+      setToast('请先配置可用的文本模型，再启动 AI 构建 Session');
       return;
     }
-    missing.forEach((kind) => addNode(kind));
-    setToast(`已补全 ${missing.length} 个基础节点，请拖拽连接`);
+    setAssistantOpen(true);
+    setConfigPanelOpen(false);
+  };
+
+  const applyAssistantDraft = (draft: WorkflowAssistantDraft): string | null => {
+    if (draft.schema !== 'aiflow.workflow-draft' || draft.schemaVersion !== 1 || !Array.isArray(draft.nodes) || !Array.isArray(draft.edges)) return '候选草案格式无效';
+    const draftNodes = draft.nodes as unknown as Node<FlowData>[];
+    const draftEdges = draft.edges as unknown as Edge[];
+    const graphValidation = validateWorkflowGraph({ nodes: draftNodes, edges: draftEdges });
+    if (!graphValidation.valid) return `应用前图校验失败：${graphValidation.issues[0]?.message || '结构无效'}`;
+    for (const node of draftNodes) {
+      if (node.data.kind !== 'llm' && node.data.kind !== 'image') continue;
+      const capability: ModelCapability = node.data.kind === 'image' ? 'image' : 'chat';
+      const provider = providers.find((candidate) => candidate.id === node.data.providerId);
+      if (!provider || !provider.models.some((model) => model.capability === capability && model.id === node.data.model)) return `节点「${node.data.title}」引用的供应商或模型当前不可用`;
+    }
+    rememberSnapshot();
+    const cleanNodes = draftNodes.map((node) => ({ ...node, selected: false, data: { ...node.data, status: 'idle' as NodeStatus } }));
+    setNodes(syncNodeProviders(cleanNodes, providers));
+    setEdges(draftEdges.map((edge) => ({ ...edge, animated: false })));
+    setWorkflowTitle(draft.title);
+    setSelectedId(cleanNodes[0]?.id || '');
+    setToast(`AI 草案已应用：${cleanNodes.length} 个节点`);
+    return null;
   };
 
   const publishWorkflow = () => {
@@ -1157,6 +1200,7 @@ function App() {
           <button className="icon-button header-tool" aria-label="下载工作流文件" data-tooltip="下载工作流文件" title="下载工作流文件" onClick={exportWorkflow}><FileDown size={17} /></button>
           <button className="icon-button header-tool" aria-label="导入工作流文件" data-tooltip="导入工作流文件" title="导入工作流文件" onClick={() => importWorkflowRef.current?.click()}><FileUp size={17} /></button>
           <input ref={importWorkflowRef} className="visually-hidden" type="file" accept="application/json,.json,.aiflow.json" onChange={(event) => { importWorkflow(event.target.files?.[0]); event.target.value = ''; }} />
+          <button className="assistant-launch-button" onClick={() => { setWorkspaceView('editor'); completeSuggestedWorkflow(); }}><Bot size={15} />AI 构建</button>
           <button className="ghost-button" onClick={() => setWorkspaceView('models')}><Settings size={16} /> 模型服务</button>
           {running ? <button className="stop-button" onClick={stopWorkflow}><Square size={14} fill="currentColor" /> 停止运行</button> : <button className="run-button" onClick={runWorkflow}><Play size={16} fill="currentColor" />试运行</button>}
           <button className="publish-button" onClick={publishWorkflow} disabled={running}><Rocket size={16} /> 发布</button>
@@ -1434,6 +1478,18 @@ function App() {
         </section>}
         {workspaceView === 'editor' && !debugOpen && <button className="open-debug" onClick={() => setDebugOpen(true)}><TerminalSquare size={15} /> 打开调试台</button>}
       </main>
+
+      <WorkflowAssistant
+        open={assistantOpen}
+        providers={providers}
+        session={assistantSession}
+        currentWorkflow={assistantWorkflow}
+        currentWorkflowRevision={assistantWorkflowRevision}
+        onSessionChange={setAssistantSession}
+        onApply={applyAssistantDraft}
+        onClose={() => setAssistantOpen(false)}
+        onOpenModels={() => { setAssistantOpen(false); setWorkspaceView('models'); }}
+      />
 
       {toast && <div className="toast" role="status">{toast}</div>}
 

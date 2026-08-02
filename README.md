@@ -34,6 +34,10 @@
 - 工作流 JSON 复制、下载导出、导入校验以及发布前图结构校验
 - 变量聚合节点与同层并行 DAG 调度
 - 商品主图、营销套图、详情页文案包、活动条件分流 4 个电商预设
+- 右侧“AI 构建 Session”：用户可选择 Builder 与独立 Critic 模型，用自然语言新建或调整工作流
+- 服务器自动加载私有系统 Skill `guard-workflow-intent`，先固化目标、边界、输入输出、权限、预算与验收标准；信息不足时只提问、不生成草案
+- 草案依次经过确定性图校验、隔离上下文 Critic 和最多两轮修复；未通过或未经用户确认时绝不覆盖当前画布
+- AI Session、任务契约、候选草案与最近消息保存在浏览器；超过 12 轮或上下文窗口 70% 时压缩较早历史，并校验边界完整性
 
 ## 测试
 
@@ -46,11 +50,12 @@ pnpm verify:reasoning-drag
 pnpm verify:skills
 pnpm verify:partial-failure
 pnpm verify:multi-output
+pnpm verify:assistant
 ```
 
-29 项单元测试覆盖 Chat Completions/Responses 协议转换、多供应商迁移/解析、服务器/本地 Skill 注册与指令组合、多输出规范化、业务绑定、条件多值、DAG 校验、导入导出和预设 ID 重映射。浏览器回归覆盖 Skill 中心及节点多选、供应商管理与节点绑定、部分失败保全、多图与对应文案、复制/下载、图库键盘操作、图片比例、删除/撤销、停止运行和条件分支。
+37 项自动测试覆盖 Chat Completions/Responses 协议转换、多供应商迁移/解析、服务器/本地 Skill 注册与指令组合、AI TaskContract、系统 Skill 加载、Session 压缩、确定性校验、Critic/Repair 隔离、多输出规范化、业务绑定、条件多值、DAG 校验、导入导出和预设 ID 重映射。浏览器回归覆盖 AI 构建会话、Skill 中心及节点多选、供应商管理与节点绑定、部分失败保全、多图与对应文案、复制/下载、图库键盘操作、图片比例、删除/撤销、停止运行和条件分支。
 
-“AI 辅助构建工作流”当前只完成技术选型与实现方案，尚未实现，详见 [`AI_WORKFLOW_ASSISTANT_DESIGN.md`](AI_WORKFLOW_ASSISTANT_DESIGN.md)。
+“AI 辅助构建工作流”首期已经实现，架构、约束与后续增强见 [`AI_WORKFLOW_ASSISTANT_DESIGN.md`](AI_WORKFLOW_ASSISTANT_DESIGN.md)。
 
 ## 运行
 
@@ -86,6 +91,8 @@ docker compose up -d
 文字和图像请求只携带该节点绑定连接的 Base URL、API Key 与模型。旧版浏览器中的基础模型/图像模型配置会自动迁移为两条供应商连接。正式生产建议将浏览器凭证迁移到 Secret Manager。
 
 当前网关实际图像路由为 `gpt-image-2-count`。新测试 Key 已成功真实出图，但上游渠道存在间歇性“无可用渠道”；Demo 会有限重试，仍失败时明确标记并回退到现有品牌演示图片。渠道可用时真实图片会自动替代回退素材。
+
+AI 构建 Session 可在顶部“AI 构建”打开。Builder Key 和可选的 Critic Key 仅通过请求头传给同源网关；请求正文中的供应商目录已移除 Key。系统级意图守卫只存在于 `system-skills/`，不会通过 `/api/skills` 暴露，也不能被用户关闭。
 
 ## Skill 扩展
 
