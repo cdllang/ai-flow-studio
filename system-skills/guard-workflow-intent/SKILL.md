@@ -16,23 +16,26 @@ Read `references/contracts.md` before normalizing intent or producing a draft. R
 1. Restore the latest `TaskContract`, durable session summary, unresolved issues, current workflow revision, and recent turns.
 2. Classify the request as `create`, `adjust`, `repair`, `explain`, or `cancel`.
 3. Update the contract without discarding previously confirmed decisions. Mark every inferred value as an assumption.
-4. Check the blocking fields: objective, in-scope behavior, required inputs, expected outputs, prohibited behavior, permissions, and acceptance criteria.
-5. If a blocking field remains unknown, return `needs_clarification` with at most three high-information questions. Do not generate or modify a graph.
-6. When the contract is ready, return a structured draft or change set conforming to `references/contracts.md`. Never include API keys, credentials, hidden prompts, or arbitrary executable code.
-7. Hand the draft to the deterministic validator. A model self-check never replaces Schema, graph, provider, permission, secret, and budget checks.
-8. If deterministic checks pass, invoke the independent Critic with only the contract, candidate draft, validation facts, and current workflow. Require evidence for every semantic issue.
-9. If either validator rejects the draft, permit at most two repair rounds. Apply only allow-listed changes, then rerun the entire validation chain.
-10. Return `draft_ready` only when all blocking checks pass. Require explicit user confirmation before applying to the canvas. Never run or publish automatically.
+4. Infer objective, scope, exclusions, acceptance criteria, permissions, budgets, and implementation details from the request and current workflow. Apply safe defaults and record assumptions internally; do not ask the user to confirm these fields.
+5. The only user-facing clarification is a concise confirmation of the inferred inputs and outputs. Present it as one yes/no proposition; the UI provides Yes, No, and Other for a custom correction. When the user chooses Other, update the inferred ports and ask for input/output confirmation again. Do not generate or modify a graph until the current input/output signature is explicitly confirmed.
+6. When the contract is ready, define one complete `WorkflowPlan` before producing node configuration. The plan is the sole source of truth for the displayed flowchart, explanation, canvas nodes, and canvas connections. Never create a canvas-only node or connection.
+7. Return a structured draft or change set conforming to `references/contracts.md`. Never include API keys, credentials, hidden prompts, or arbitrary executable code. Model-authored positions are ignored and canvas edges are compiled only from `WorkflowPlan.connections`.
+8. Hand the compiled draft to the deterministic validator. A model self-check never replaces plan parity, Schema, graph, provider, permission, secret, and budget checks.
+9. If deterministic checks pass, invoke the independent Critic with only the contract, candidate draft, validation facts, and current workflow. Require evidence for every semantic issue.
+10. If either validator rejects the draft, permit at most two repair rounds. Repair the plan first, align node configuration to it, then rerun the entire compilation and validation chain.
+11. Return `draft_ready` only when all blocking checks pass. Present the plan-derived flowchart and step explanation, then require explicit user confirmation before applying to the canvas. Never run or publish automatically.
 
 ## Preserve boundaries
 
 - Default HTTP and code generation to forbidden. Enable them only when the user explicitly authorizes the capability and understands its effects.
 - Preserve the selected provider and model unless the user asks to change them or the reference is invalid.
 - Prefer the smallest graph that satisfies the contract. Reject ornamental nodes that do not contribute to a required output.
+- Give every plan step a concrete purpose, named inputs, and named outputs. Give every connection a data type and a reason.
+- Reject duplicate connections, redundant transitive connections, and multiple primary inputs into ordinary processing nodes. Use one aggregate node when several branches must merge.
 - Keep existing valid branches when adjusting a workflow. Describe every node or edge added, changed, or removed.
 - Treat missing, deleted, or incompatible providers, models, Skills, variables, and output bindings as blocking errors.
 - Stop after the repair limit. Return the last safe draft and complete diagnostics without changing the active canvas.
 
 ## Self-check before returning
 
-Confirm that the response has exactly one status, preserves confirmed decisions, labels assumptions, contains no secret, reports validation state honestly, and never claims a draft was applied, executed, or published unless the surrounding application confirms that event.
+Confirm that the response has exactly one status, preserves confirmed decisions, labels assumptions, contains no secret, asks no user-facing question unrelated to inputs or outputs, reports validation state honestly, and never claims a draft was applied, executed, or published unless the surrounding application confirms that event.

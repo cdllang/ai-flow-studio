@@ -8,12 +8,16 @@ import { loadWorkflowAssistantSkill } from './system-skill-loader.mjs';
 import {
   addSessionTurn,
   applySessionCompression,
+  compileWorkflowDraft,
   extractJsonObject,
+  inputOutputConfirmationQuestion,
+  inputOutputSignature,
   maxAssistantRepairAttempts,
   normalizeAssistantEnvelope,
   normalizeAssistantSession,
   normalizeTaskContract,
   publicAssistantProviderCatalog,
+  resolveAssistantModelTimeout,
   shouldCompressSession,
   validateWorkflowDraft,
   validationReport
@@ -88,30 +92,46 @@ class TextModelError extends Error {
     this.upstreamRequestId = upstreamRequestId;
   }
 }
+const assistantModelTimeoutMs = resolveAssistantModelTimeout(process.env.ASSISTANT_MODEL_TIMEOUT_MS, { isTest: process.env.NODE_ENV === 'test' });
+const assistantModelRetryDelayMs = (() => {
+  const configured = Number.parseInt(process.env.ASSISTANT_MODEL_RETRY_DELAY_MS || '350', 10);
+  return Number.isFinite(configured) ? Math.max(0, Math.min(configured, 5_000)) : 350;
+})();
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const isTimeoutError = (error) => error?.name === 'TimeoutError' || /timed?\s*out|timeout/i.test(safeError(error));
 const callTextModel = async ({ apiKey, baseUrl: upstreamBaseUrl, model, protocol, reasoningEffort, system, prompt, temperature }) => {
   let response;
-  try {
-    response = await fetch(`${upstreamBaseUrl}/${protocol === 'responses' ? 'responses' : 'chat/completions'}`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      signal: AbortSignal.timeout(90_000),
-      body: JSON.stringify(protocol === 'responses' ? {
-        model,
-        input: prompt,
-        ...(system ? { instructions: system } : {}),
-        reasoning: { effort: reasoningEffort },
-        ...(typeof temperature === 'number' ? { temperature } : {}),
-        stream: false
-      } : {
-        model,
-        messages: [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: prompt }],
-        reasoning_effort: reasoningEffort,
-        temperature: typeof temperature === 'number' ? temperature : 0.2,
-        stream: false
-      })
-    });
-  } catch (error) {
-    throw new TextModelError(safeError(error), 'ASSISTANT_MODEL_NETWORK_ERROR', 502);
+  const requestBody = JSON.stringify(protocol === 'responses' ? {
+    model,
+    input: prompt,
+    ...(system ? { instructions: system } : {}),
+    reasoning: { effort: reasoningEffort },
+    ...(typeof temperature === 'number' ? { temperature } : {}),
+    stream: false
+  } : {
+    model,
+    messages: [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: prompt }],
+    reasoning_effort: reasoningEffort,
+    temperature: typeof temperature === 'number' ? temperature : 0.2,
+    stream: false
+  });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      response = await fetch(`${upstreamBaseUrl}/${protocol === 'responses' ? 'responses' : 'chat/completions'}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(assistantModelTimeoutMs),
+        body: requestBody
+      });
+      break;
+    } catch (error) {
+      if (attempt === 0) {
+        await wait(assistantModelRetryDelayMs);
+        continue;
+      }
+      if (isTimeoutError(error)) throw new TextModelError('上游模型响应超时，已自动重试 1 次；请稍后重试或切换模型', 'ASSISTANT_MODEL_TIMEOUT', 504);
+      throw new TextModelError(`上游模型网络连接失败，已自动重试 1 次：${safeError(error)}`, 'ASSISTANT_MODEL_NETWORK_ERROR', 502);
+    }
   }
   const data = await response.json().catch(() => ({}));
   const upstreamRequestId = response.headers.get('x-request-id') || data?.request_id || '';
@@ -154,6 +174,12 @@ app.post('/api/workflow-assistant/turn', async (req, res) => {
   const body = req.body ?? {};
   const message = typeof body.message === 'string' ? body.message.trim() : '';
   if (!message || message.length > 20_000) return res.status(400).json({ code: 'ASSISTANT_MESSAGE_INVALID', message: 'Session 消息不能为空且不能超过 20000 个字符', requestId: id });
+  const confirmationInput = body.confirmation && typeof body.confirmation === 'object' ? body.confirmation : null;
+  const confirmation = confirmationInput && ['yes', 'no', 'other'].includes(confirmationInput.answer) ? {
+    answer: confirmationInput.answer,
+    question: typeof confirmationInput.question === 'string' ? confirmationInput.question.trim().slice(0, 500) : '',
+    detail: typeof confirmationInput.detail === 'string' ? confirmationInput.detail.trim().slice(0, 2_000) : ''
+  } : null;
 
   let builder;
   let critic;
@@ -188,7 +214,15 @@ app.post('/api/workflow-assistant/turn', async (req, res) => {
   session.providerId = builder.id;
   session.modelId = builder.model;
   session.currentWorkflowRevision = typeof body.currentWorkflowRevision === 'string' ? body.currentWorkflowRevision.slice(0, 200) : session.currentWorkflowRevision;
-  session = addSessionTurn(session, 'user', message);
+  const expectedInputOutputQuestion = inputOutputConfirmationQuestion(session.contract);
+  const confirmingCurrentInputOutput = confirmation?.question === expectedInputOutputQuestion
+    && session.contract.inputs.length > 0
+    && session.contract.outputs.length > 0;
+  if (confirmation?.answer === 'yes' && confirmingCurrentInputOutput) session.confirmedInputOutputSignature = inputOutputSignature(session.contract);
+  else if (confirmation) session.confirmedInputOutputSignature = '';
+  const lastTurn = session.recentTurns.at(-1);
+  const retryingSameTurn = body.retry === true && lastTurn?.role === 'user' && lastTurn.content === message;
+  if (!retryingSameTurn) session = addSessionTurn(session, 'user', message);
 
   const requestedPermissions = body.permissions && typeof body.permissions === 'object' ? body.permissions : session.contract.constraints;
   const authoritativeConstraints = {
@@ -208,12 +242,14 @@ app.post('/api/workflow-assistant/turn', async (req, res) => {
       summary: session.summary,
       recentTurns: session.recentTurns,
       currentWorkflowRevision: session.currentWorkflowRevision,
-      repairAttempt: session.repairAttempt
+      repairAttempt: session.repairAttempt,
+      confirmedInputOutputSignature: session.confirmedInputOutputSignature
     },
     currentWorkflow,
     providers: providerCatalog,
     availableNodeKinds: ['start', 'llm', 'image', 'condition', 'http', 'code', 'aggregate', 'output'],
     permissions: authoritativeConstraints,
+    confirmation,
     latestMessage: message
   });
 
@@ -257,17 +293,38 @@ app.post('/api/workflow-assistant/turn', async (req, res) => {
   }
 
   const applyAuthoritativeConstraints = (contract) => ({ ...normalizeTaskContract(contract), constraints: { ...normalizeTaskContract(contract).constraints, ...authoritativeConstraints } });
-  const builderSystem = `${workflowAssistantSkill.builder}\n\n${workflowAssistantSkill.contracts}\n\nYou are the Builder entrypoint. Return exactly one JSON AssistantTurn object and no markdown. Use only the supplied node, provider, and model catalogs. Every draft node status must be idle.`;
+  const builderSystem = `${workflowAssistantSkill.builder}\n\n${workflowAssistantSkill.contracts}\n\nYou are the Builder entrypoint. Return exactly one JSON AssistantTurn object and no markdown. WorkflowPlan is the sole source of truth: define every step, responsibility, input/output, and justified connection there first. The application will ignore model-authored positions and compile canvas edges exclusively from WorkflowPlan.connections. Use only the supplied node, provider, and model catalogs. Every draft node status must be idle. Treat a supplied confirmation object as the user's authoritative answer to that exact question. The only user-facing clarification allowed is confirmation of the inferred inputs and outputs. Infer scope, exclusions, acceptance criteria, permissions, budgets, and implementation details using safe defaults; never ask the user to confirm them. The application itself will render the one input/output confirmation question.`;
   let envelope;
   try {
     session.phase = 'drafting';
-    stages.push({ stage: 'intent', status: 'running', detail: '系统 Skill 正在确认目标、边界与验收标准' });
+    stages.push({ stage: 'intent', status: 'running', detail: '系统 Skill 正在识别并核对任务输入与输出' });
     const builderResponse = await callTextModel({ ...builder, system: builderSystem, prompt: JSON.stringify(contextForBuilder()) });
     envelope = normalizeAssistantEnvelope(extractJsonObject(builderResponse.text));
     envelope.contract = applyAuthoritativeConstraints(envelope.contract);
-    stages[stages.length - 1] = { stage: 'intent', status: 'success', detail: envelope.status === 'needs_clarification' ? `需要补充 ${envelope.questions.length} 项信息` : '任务契约已生成' };
+    if (!envelope.contract.objective) envelope.contract.objective = message.slice(0, 1_000);
+    const nextInputOutputSignature = inputOutputSignature(envelope.contract);
+    const inputOutputConfirmed = envelope.contract.inputs.length > 0
+      && envelope.contract.outputs.length > 0
+      && session.confirmedInputOutputSignature === nextInputOutputSignature;
+    if (!['blocked', 'cancelled'].includes(envelope.status) && !inputOutputConfirmed) {
+      const question = inputOutputConfirmationQuestion(envelope.contract);
+      session.confirmedInputOutputSignature = '';
+      envelope = {
+        status: 'needs_clarification',
+        message: '请确认 AI 识别出的输入与输出是否符合你的要求。',
+        contract: { ...envelope.contract, unresolvedQuestions: [question] },
+        questions: [question]
+      };
+    } else if (envelope.status === 'needs_clarification') {
+      throw new Error('输入与输出已经确认，Builder 不应继续请求其他确认');
+    } else {
+      envelope.contract.unresolvedQuestions = [];
+    }
+    stages[stages.length - 1] = { stage: 'intent', status: 'success', detail: envelope.status === 'needs_clarification' ? '等待用户确认输入与输出' : '输入与输出已经确认' };
   } catch (error) {
     const status = error instanceof TextModelError ? error.status : 502;
+    session.phase = 'blocked';
+    if (stages.at(-1)?.status === 'running') stages[stages.length - 1] = { ...stages.at(-1), status: 'error', detail: safeError(error) };
     return res.status(status).json({ code: error.code || 'ASSISTANT_BUILDER_INVALID', message: safeError(error), requestId: id, upstreamRequestId: error.upstreamRequestId || '', session, stages });
   }
 
@@ -278,12 +335,12 @@ app.post('/api/workflow-assistant/turn', async (req, res) => {
     return res.set('Cache-Control', 'no-store').json({ schemaVersion: 1, response: envelope, session, stages, compression, systemSkill: { id: workflowAssistantSkill.id, version: workflowAssistantSkill.version, autoApplied: true }, requestId: id });
   }
 
-  let candidateDraft = envelope.draft;
+  let candidateDraft = compileWorkflowDraft(envelope.draft);
   let report = validationReport({ valid: false, issues: [] }, [], 0);
   let repairAttempt = 0;
   while (repairAttempt <= maxAssistantRepairAttempts) {
     session.phase = 'validating';
-    stages.push({ stage: 'deterministic_validation', status: 'running', detail: '正在检查 Schema、图结构、权限、模型引用、Secret 与预算' });
+    stages.push({ stage: 'deterministic_validation', status: 'running', detail: '正在按流程图编译并检查 Schema、连线、权限、模型引用、Secret 与预算' });
     const deterministic = validateWorkflowDraft(candidateDraft, { providers: providerCatalog, constraints: authoritativeConstraints });
     stages[stages.length - 1] = { stage: 'deterministic_validation', status: deterministic.valid ? 'success' : 'error', detail: deterministic.valid ? '确定性检查全部通过' : `发现 ${deterministic.issues.length} 个结构问题` };
 
@@ -316,12 +373,12 @@ app.post('/api/workflow-assistant/turn', async (req, res) => {
     try {
       const repairResponse = await callTextModel({
         ...builder,
-        system: `${workflowAssistantSkill.builder}\n\n${workflowAssistantSkill.contracts}\n\nYou are the Repair entrypoint. Return one complete draft_ready AssistantTurn JSON object. Preserve the contract and change only allow-listed workflow draft fields. Never change permissions, provider credentials, schema version, validation state, or repair counters.`,
+        system: `${workflowAssistantSkill.builder}\n\n${workflowAssistantSkill.contracts}\n\nYou are the Repair entrypoint. Return one complete draft_ready AssistantTurn JSON object. WorkflowPlan remains the sole source of truth; repair the plan first and keep node configs aligned with its step ids and kinds. Do not add direct or transitive connections when an existing path already carries the same dependency. Preserve the contract and change only allow-listed workflow draft fields. Never change permissions, provider credentials, schema version, validation state, or repair counters.`,
         prompt: JSON.stringify({ contract: envelope.contract, candidateDraft, validation: report, currentWorkflow, providers: providerCatalog, permissions: authoritativeConstraints })
       });
       const repaired = normalizeAssistantEnvelope(extractJsonObject(repairResponse.text));
       if (repaired.status !== 'draft_ready' || !repaired.draft) throw new Error('修复模型未返回完整草案');
-      candidateDraft = repaired.draft;
+      candidateDraft = compileWorkflowDraft(repaired.draft);
       envelope.message = repaired.message;
       stages[stages.length - 1] = { stage: 'repair', status: 'success', detail: `第 ${repairAttempt} 轮修复已生成，重新执行全部检查` };
     } catch (error) {

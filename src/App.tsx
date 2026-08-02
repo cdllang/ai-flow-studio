@@ -66,6 +66,7 @@ import {
   assistantSessionStorageKey,
   createWorkflowAssistantSession,
   loadStoredAssistantSession,
+  validateAssistantDraftPlanParity,
   workflowRevision,
   type WorkflowAssistantDraft,
   type WorkflowAssistantSession
@@ -816,6 +817,8 @@ function App() {
 
   const applyAssistantDraft = (draft: WorkflowAssistantDraft): string | null => {
     if (draft.schema !== 'aiflow.workflow-draft' || draft.schemaVersion !== 1 || !Array.isArray(draft.nodes) || !Array.isArray(draft.edges)) return '候选草案格式无效';
+    const planParityError = validateAssistantDraftPlanParity(draft);
+    if (planParityError) return `应用前流程图校验失败：${planParityError}`;
     const draftNodes = draft.nodes as unknown as Node<FlowData>[];
     const draftEdges = draft.edges as unknown as Edge[];
     const graphValidation = validateWorkflowGraph({ nodes: draftNodes, edges: draftEdges });

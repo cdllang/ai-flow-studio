@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, Bot, Check, ChevronDown, CircleStop, FileCheck2, LoaderCircle, Plus, RotateCcw, Send, ShieldCheck, Sparkles, X } from 'lucide-react';
-import { assistantProviderCatalog, createWorkflowAssistantSession, type AssistantStage, type WorkflowAssistantDraft, type WorkflowAssistantResponse, type WorkflowAssistantSession } from '../assistantSession';
+import { AlertTriangle, ArrowRight, Bot, Check, ChevronDown, CircleStop, GitBranch, ListTree, LoaderCircle, Plus, RotateCcw, Send, ShieldCheck, Sparkles, X } from 'lucide-react';
+import { assistantProviderCatalog, createWorkflowAssistantSession, type AssistantStage, type WorkflowAssistantDraft, type WorkflowAssistantResponse, type WorkflowAssistantSession, type WorkflowPlan } from '../assistantSession';
 import { providersForCapability, type ModelProvider } from '../providerConfig';
 
 type WorkflowAssistantProps = {
@@ -20,8 +20,105 @@ const phaseLabel: Record<WorkflowAssistantSession['phase'], string> = {
 };
 
 const stageLabel: Record<string, string> = {
-  compression: '压缩上下文', intent: '确认目标与边界', deterministic_validation: '确定性校验', critic: '独立 Critic', repair: '受限修复'
+  compression: '压缩上下文', intent: '识别输入与输出', deterministic_validation: '确定性校验', critic: '独立 Critic', repair: '受限修复'
 };
+type ConfirmationPayload = { answer: 'yes' | 'no' | 'other'; question: string; detail?: string };
+type RetryAttempt = { message: string; confirmation?: ConfirmationPayload };
+
+const planKindLabel: Record<WorkflowPlan['steps'][number]['kind'], string> = {
+  start: '开始', llm: '大模型', image: '图像生成', condition: '条件', http: 'HTTP', code: '代码', aggregate: '聚合', output: '输出'
+};
+
+function planPreviewLayout(plan: WorkflowPlan) {
+  const nodeWidth = 126;
+  const nodeHeight = 48;
+  const horizontalGap = 54;
+  const verticalGap = 24;
+  const padding = 24;
+  const stepIds = new Set(plan.steps.map((step) => step.id));
+  const outgoing = new Map(plan.steps.map((step) => [step.id, [] as string[]]));
+  const indegree = new Map(plan.steps.map((step) => [step.id, 0]));
+  for (const connection of plan.connections) {
+    if (!stepIds.has(connection.source) || !stepIds.has(connection.target)) continue;
+    outgoing.get(connection.source)?.push(connection.target);
+    indegree.set(connection.target, (indegree.get(connection.target) || 0) + 1);
+  }
+  const depths = new Map(plan.steps.map((step) => [step.id, 0]));
+  const queue = [...indegree].filter(([, count]) => count === 0).map(([stepId]) => stepId);
+  while (queue.length) {
+    const source = queue.shift()!;
+    for (const target of outgoing.get(source) || []) {
+      depths.set(target, Math.max(depths.get(target) || 0, (depths.get(source) || 0) + 1));
+      indegree.set(target, (indegree.get(target) || 0) - 1);
+      if (indegree.get(target) === 0) queue.push(target);
+    }
+  }
+  const layers = new Map<number, string[]>();
+  for (const step of plan.steps) {
+    const layer = depths.get(step.id) || 0;
+    layers.set(layer, [...(layers.get(layer) || []), step.id]);
+  }
+  const layerCount = Math.max(0, ...layers.keys()) + 1;
+  const maxRows = Math.max(1, ...[...layers.values()].map((items) => items.length));
+  const width = padding * 2 + layerCount * nodeWidth + Math.max(0, layerCount - 1) * horizontalGap;
+  const height = padding * 2 + maxRows * nodeHeight + Math.max(0, maxRows - 1) * verticalGap;
+  const positions = new Map<string, { x: number; y: number }>();
+  for (const [layer, stepIdsInLayer] of layers) {
+    const layerHeight = stepIdsInLayer.length * nodeHeight + Math.max(0, stepIdsInLayer.length - 1) * verticalGap;
+    const startY = (height - layerHeight) / 2;
+    stepIdsInLayer.forEach((stepId, index) => positions.set(stepId, { x: padding + layer * (nodeWidth + horizontalGap), y: startY + index * (nodeHeight + verticalGap) }));
+  }
+  return { nodeWidth, nodeHeight, width, height, positions };
+}
+
+function WorkflowPlanPreview({ draft, applied, disabled, onApply, onRevise }: { draft: WorkflowAssistantDraft; applied: boolean; disabled: boolean; onApply: () => void; onRevise: () => void }) {
+  const plan = draft.plan;
+  const layout = useMemo(() => planPreviewLayout(plan), [plan]);
+  const stepById = useMemo(() => new Map(plan.steps.map((step) => [step.id, step])), [plan]);
+  return <section className="assistant-plan" aria-label="AI 流程方案预览">
+    <header className="assistant-plan-head">
+      <div><span><GitBranch size={15} /></span><div><strong>{draft.title}</strong><small>流程图是节点与连线的唯一来源</small></div></div>
+      <span>{plan.steps.length} 节点 · {plan.connections.length} 连线</span>
+    </header>
+    <p className="assistant-plan-summary">{plan.summary}</p>
+    <div className="assistant-flowchart-scroll" aria-label="工作流流程图">
+      <div className="assistant-flowchart" style={{ width: layout.width, height: layout.height }}>
+        <svg width={layout.width} height={layout.height} aria-hidden="true">
+          {plan.connections.map((connection) => {
+            const source = layout.positions.get(connection.source);
+            const target = layout.positions.get(connection.target);
+            if (!source || !target) return null;
+            const startX = source.x + layout.nodeWidth;
+            const startY = source.y + layout.nodeHeight / 2;
+            const endX = target.x;
+            const endY = target.y + layout.nodeHeight / 2;
+            const middleX = startX + Math.max(18, (endX - startX) / 2);
+            return <g key={connection.id}><path d={`M ${startX} ${startY} H ${middleX} V ${endY} H ${endX}`} /><circle cx={endX - 3} cy={endY} r="2.5" />{connection.sourceHandle && <text x={startX + 7} y={startY - 5}>{connection.sourceHandle === 'true' ? '是' : '否'}</text>}</g>;
+          })}
+        </svg>
+        {plan.steps.map((step, index) => {
+          const position = layout.positions.get(step.id) || { x: 0, y: 0 };
+          return <div className={`assistant-flow-step kind-${step.kind}`} style={{ left: position.x, top: position.y, width: layout.nodeWidth, height: layout.nodeHeight }} key={step.id} title={step.purpose}>
+            <span>{String(index + 1).padStart(2, '0')}</span><div><small>{planKindLabel[step.kind]}</small><strong>{step.title}</strong></div>
+          </div>;
+        })}
+      </div>
+    </div>
+    <details className="assistant-plan-explanation" open>
+      <summary><span><ListTree size={13} />流程说明</span><small>全部内容均从同一流程定义生成</small></summary>
+      <div className="assistant-plan-steps">
+        {plan.steps.map((step, index) => <article key={step.id}>
+          <span>{index + 1}</span><div><header><strong>{step.title}</strong><code>{step.id}</code></header><p>{step.purpose}</p><small>输入：{step.inputs.length ? step.inputs.join('、') : '无'} · 输出：{step.outputs.length ? step.outputs.join('、') : '无'}</small></div>
+        </article>)}
+      </div>
+      <div className="assistant-plan-connections">
+        <strong>数据流向</strong>
+        {plan.connections.map((connection) => <div key={connection.id}><span>{stepById.get(connection.source)?.title || connection.source}</span><ArrowRight size={11} /><span>{stepById.get(connection.target)?.title || connection.target}</span><small>{connection.reason} · {connection.dataType}</small></div>)}
+      </div>
+    </details>
+    <footer className="assistant-plan-actions"><button onClick={onRevise} disabled={applied}>需要调整</button><button className="primary" disabled={disabled || applied} onClick={onApply}>{applied ? '已应用' : disabled ? '等待本轮校验' : '确认并应用'}</button></footer>
+  </section>;
+}
 
 export function WorkflowAssistant({ open, providers, session, currentWorkflow, currentWorkflowRevision, onSessionChange, onApply, onClose, onOpenModels }: WorkflowAssistantProps) {
   const chatProviders = useMemo(() => providersForCapability(providers, 'chat').filter((provider) => provider.apiKey), [providers]);
@@ -32,13 +129,19 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
   const [message, setMessage] = useState('');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
+  const [errorCode, setErrorCode] = useState('');
+  const [retryAttempt, setRetryAttempt] = useState<RetryAttempt | null>(null);
   const [stages, setStages] = useState<AssistantStage[]>([]);
   const [compressionNotice, setCompressionNotice] = useState('');
+  const [customAnswerOpen, setCustomAnswerOpen] = useState(false);
+  const [customAnswer, setCustomAnswer] = useState('');
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const builderSelectRef = useRef<HTMLSelectElement | null>(null);
   const builder = connections.find((entry) => entry.key === builderKey) || initialConnection;
   const critic = criticKey === 'same' ? null : connections.find((entry) => entry.key === criticKey) || null;
   const draftStale = Boolean(session.candidateDraft && session.phase !== 'applied' && session.currentWorkflowRevision && session.currentWorkflowRevision !== currentWorkflowRevision);
+  const pendingQuestion = session.phase === 'discovery' ? session.contract.unresolvedQuestions[0] || '' : '';
 
   useEffect(() => {
     if (!builderKey && initialConnection) setBuilderKey(initialConnection.key);
@@ -51,11 +154,13 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
 
   if (!open) return null;
 
-  const send = async () => {
-    const userMessage = message.trim();
+  const send = async (overrideMessage?: string, confirmation?: ConfirmationPayload, retry = false) => {
+    const userMessage = (overrideMessage ?? message).trim();
     if (!userMessage || !builder || sending) return;
+    setRetryAttempt({ message: userMessage, confirmation });
     setSending(true);
     setError('');
+    setErrorCode('');
     setStages([{ stage: 'intent', status: 'running', detail: '正在调用系统级意图守卫' }]);
     setCompressionNotice('');
     const controller = new AbortController();
@@ -77,18 +182,31 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
           providers: assistantProviderCatalog(providers),
           permissions: session.contract.constraints,
           currentWorkflow,
-          currentWorkflowRevision
+          currentWorkflowRevision,
+          confirmation,
+          retry
         })
       });
       const data = await response.json() as WorkflowAssistantResponse & { code?: string; message?: string };
       if (data.session) onSessionChange(data.session);
       if (Array.isArray(data.stages)) setStages(data.stages);
       if (data.compression?.compressed) setCompressionNotice(`已自动压缩 ${data.compression.sourceTurns || 0} 条较早消息，保留最近 ${data.compression.retainedTurns || 0} 条原文`);
-      if (!response.ok) throw new Error(data.message || data.code || `AI 工作流助手返回 ${response.status}`);
+      if (!response.ok) {
+        setErrorCode(data.code || `HTTP_${response.status}`);
+        throw new Error(data.message || data.code || `AI 工作流助手返回 ${response.status}`);
+      }
       setMessage('');
+      setCustomAnswer('');
+      setCustomAnswerOpen(false);
+      setRetryAttempt(null);
     } catch (reason) {
-      if (reason instanceof DOMException && reason.name === 'AbortError') setError('本次生成已停止，Session 上下文仍已保留');
-      else setError(reason instanceof Error ? reason.message : 'AI 工作流助手调用失败');
+      const failureMessage = reason instanceof DOMException && reason.name === 'AbortError'
+        ? '本次生成已停止，Session 上下文仍已保留'
+        : reason instanceof Error ? reason.message : 'AI 工作流助手调用失败';
+      if (reason instanceof DOMException && reason.name === 'AbortError') setErrorCode('ASSISTANT_REQUEST_ABORTED');
+      else setErrorCode((current) => current || 'ASSISTANT_REQUEST_FAILED');
+      setError(failureMessage);
+      setStages((items) => items.map((stage) => stage.status === 'running' ? { ...stage, status: 'error', detail: failureMessage } : stage));
     } finally {
       abortRef.current = null;
       setSending(false);
@@ -100,11 +218,15 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
     onSessionChange(createWorkflowAssistantSession(builder?.provider.id, builder?.model.id));
     setStages([]);
     setCompressionNotice('');
+    setCustomAnswer('');
+    setCustomAnswerOpen(false);
     setError('');
+    setErrorCode('');
+    setRetryAttempt(null);
   };
 
   const applyDraft = () => {
-    if (!session.candidateDraft || !session.validation?.valid) return;
+    if (sending || session.phase !== 'awaiting_confirmation' || !session.candidateDraft || !session.validation?.valid) return;
     if (draftStale) return setError('当前画布在草案生成后已经变化。为避免覆盖新修改，请让 AI 基于最新画布重新生成草案。');
     const applyError = onApply(session.candidateDraft);
     if (applyError) return setError(applyError);
@@ -123,7 +245,7 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
 
     <section className="assistant-model-bar">
       {connections.length ? <>
-        <label><span>Builder</span><div><select aria-label="AI Builder 模型" value={builder?.key || ''} onChange={(event) => setBuilderKey(event.target.value)}>{connections.map((entry) => <option key={entry.key} value={entry.key}>{entry.provider.name} · {entry.model.id}</option>)}</select><ChevronDown size={13} /></div></label>
+        <label><span>Builder</span><div><select ref={builderSelectRef} aria-label="AI Builder 模型" value={builder?.key || ''} onChange={(event) => setBuilderKey(event.target.value)}>{connections.map((entry) => <option key={entry.key} value={entry.key}>{entry.provider.name} · {entry.model.id}</option>)}</select><ChevronDown size={13} /></div></label>
         <label><span>Critic</span><div><select aria-label="AI Critic 模型" value={criticKey} onChange={(event) => setCriticKey(event.target.value)}><option value="same">同模型 · 隔离上下文</option>{connections.map((entry) => <option key={entry.key} value={entry.key}>{entry.provider.name} · {entry.model.id}</option>)}</select><ChevronDown size={13} /></div></label>
       </> : <button className="assistant-empty-model" onClick={onOpenModels}>请先配置可用的文本模型</button>}
     </section>
@@ -131,12 +253,12 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
     <div className="assistant-skill-lock"><ShieldCheck size={14} /><span><strong>guard-workflow-intent</strong>系统级自动调用 · 用户不可关闭</span></div>
 
     <div className="assistant-scroll" ref={messagesRef}>
-      {!session.recentTurns.length && <div className="assistant-welcome"><Sparkles size={22} /><strong>描述你希望创建或调整的工作流</strong><p>我会先确认目标、范围、输入输出与验收标准。信息不足时不会直接修改画布。</p><div><button onClick={() => setMessage('根据当前工作流，为三个渠道分别生成商品图片和对应文案。')}>创建多渠道内容流</button><button onClick={() => setMessage('检查当前工作流并减少不必要的模型调用，同时保留全部输出。')}>优化当前工作流</button></div></div>}
+      {!session.recentTurns.length && <div className="assistant-welcome"><Sparkles size={22} /><strong>描述你希望创建或调整的工作流</strong><p>我会识别任务并只请你确认输入与输出，其他实现边界按安全默认值自动处理。</p><div><button onClick={() => setMessage('根据当前工作流，为三个渠道分别生成商品图片和对应文案。')}>创建多渠道内容流</button><button onClick={() => setMessage('检查当前工作流并减少不必要的模型调用，同时保留全部输出。')}>优化当前工作流</button></div></div>}
       {session.recentTurns.map((turn) => <article className={`assistant-message ${turn.role}`} key={turn.id}><span>{turn.role === 'user' ? '你' : <Bot size={13} />}</span><div><p>{turn.content}</p><time>{new Date(turn.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div></article>)}
       {sending && <article className="assistant-message assistant loading"><span><LoaderCircle className="spin" size={13} /></span><div><p>正在执行系统 Skill 与校验链…</p></div></article>}
 
       {(session.contract.objective || session.contract.unresolvedQuestions.length > 0) && <section className="assistant-contract">
-        <header><strong>任务契约</strong><span>{session.contract.unresolvedQuestions.length ? `${session.contract.unresolvedQuestions.length} 项待确认` : '边界已明确'}</span></header>
+        <header><strong>任务摘要</strong><span>{session.contract.unresolvedQuestions.length ? '待确认输入输出' : '输入输出已确认'}</span></header>
         {session.contract.objective && <p>{session.contract.objective}</p>}
         <dl><div><dt>输入</dt><dd>{session.contract.inputs.length}</dd></div><div><dt>输出</dt><dd>{session.contract.outputs.length}</dd></div><div><dt>验收标准</dt><dd>{session.contract.acceptanceCriteria.length}</dd></div></dl>
         <div className="assistant-permissions">
@@ -147,20 +269,29 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
         </div>
       </section>}
 
+      {pendingQuestion && <section className="assistant-confirmation">
+        <header><strong>确认输入与输出</strong><small>请选择一个回答</small></header>
+        <p>{pendingQuestion}</p>
+        <div className="assistant-confirmation-actions">
+          <button disabled={sending} onClick={() => void send(`对“${pendingQuestion}”的回答：是`, { answer: 'yes', question: pendingQuestion })}>是</button>
+          <button disabled={sending} onClick={() => void send(`对“${pendingQuestion}”的回答：否`, { answer: 'no', question: pendingQuestion })}>否</button>
+          <button className={customAnswerOpen ? 'active' : ''} disabled={sending} onClick={() => setCustomAnswerOpen((value) => !value)}>其他</button>
+        </div>
+        {customAnswerOpen && <div className="assistant-custom-answer"><textarea autoFocus aria-label="其他确认内容" value={customAnswer} onChange={(event) => setCustomAnswer(event.target.value)} placeholder="输入需要修改或补充的内容…" /><button disabled={sending || !customAnswer.trim()} onClick={() => void send(`对“${pendingQuestion}”的补充：${customAnswer.trim()}`, { answer: 'other', question: pendingQuestion, detail: customAnswer.trim() })}>提交补充</button></div>}
+      </section>}
+
       {compressionNotice && <div className="assistant-compression"><RotateCcw size={13} />{compressionNotice}</div>}
       {stages.length > 0 && <section className="assistant-stages"><header><strong>校验链</strong><small>服务端不可绕过</small></header>{stages.map((stage, index) => <div key={`${stage.stage}-${index}`} className={stage.status}><span>{stage.status === 'running' ? <LoaderCircle className="spin" size={12} /> : stage.status === 'success' ? <Check size={12} /> : <X size={12} />}</span><div><strong>{stageLabel[stage.stage] || stage.stage}</strong><small>{stage.detail}</small></div></div>)}</section>}
 
-      {session.validation && <section className={`assistant-validation ${session.validation.valid ? 'valid' : 'invalid'}`}>
+      {!sending && session.validation && (!session.validation.valid || session.phase === 'awaiting_confirmation' || session.phase === 'applied') && <section className={`assistant-validation ${session.validation.valid ? 'valid' : 'invalid'}`}>
         <header>{session.validation.valid ? <Check size={14} /> : <AlertTriangle size={14} />}<strong>{session.validation.valid ? '草案已通过严格校验' : '草案已阻断'}</strong><span>{session.validation.repairAttempt} 次修复</span></header>
         {session.validation.issues.slice(0, 6).map((issue, index) => <div className={`assistant-issue ${issue.severity}`} key={`${issue.code}-${index}`}><code>{issue.code}</code><p>{issue.message}</p>{issue.evidence && <small>{issue.evidence}</small>}</div>)}
       </section>}
 
-      {session.candidateDraft && <section className="assistant-draft">
-        <span><FileCheck2 size={17} /></span><div><strong>{session.candidateDraft.title}</strong><small>{session.candidateDraft.nodes.length} 个节点 · {session.candidateDraft.edges.length} 条连接</small></div>
-        <button disabled={!session.validation?.valid || session.phase === 'applied' || draftStale} onClick={applyDraft}>{session.phase === 'applied' ? '已应用' : '确认应用'}</button>
-      </section>}
+      {sending && session.candidateDraft?.plan && <section className="assistant-plan-refreshing" role="status"><span><LoaderCircle className="spin" size={16} /></span><div><strong>正在生成新版流程方案</strong><small>上一版已锁定，等待本轮校验链完成</small></div></section>}
+      {!sending && session.candidateDraft?.plan && <WorkflowPlanPreview draft={session.candidateDraft} applied={session.phase === 'applied'} disabled={session.phase !== 'awaiting_confirmation' || !session.validation?.valid || draftStale} onApply={applyDraft} onRevise={() => { setMessage('请调整当前流程方案：'); requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('.assistant-composer textarea')?.focus()); }} />}
       {draftStale && <div className="assistant-error"><AlertTriangle size={14} />画布已更新，此草案不能覆盖最新修改。请继续对话以重新生成。</div>}
-      {error && <div className="assistant-error"><AlertTriangle size={14} />{error}</div>}
+      {error && <div className="assistant-error" role="alert"><div className="assistant-error-copy"><AlertTriangle size={14} /><span>{errorCode && <code>{errorCode}</code>}{error}</span></div><div className="assistant-error-actions">{retryAttempt && <button onClick={() => void send(retryAttempt.message, retryAttempt.confirmation, true)}>重新尝试</button>}<button onClick={() => builderSelectRef.current?.focus()}>切换模型</button></div></div>}
     </div>
 
     <footer className="assistant-composer">

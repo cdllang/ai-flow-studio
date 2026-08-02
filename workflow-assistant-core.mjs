@@ -1,5 +1,6 @@
 const nodeIdPattern = /^[a-z][a-z0-9-]{0,63}$/;
 const allowedKinds = new Set(['start', 'llm', 'image', 'condition', 'http', 'code', 'aggregate', 'output']);
+const allowedPlanDataTypes = new Set(['text', 'image', 'file', 'json', 'mixed']);
 const allowedPhases = new Set(['discovery', 'drafting', 'validating', 'repairing', 'awaiting_confirmation', 'applied', 'blocked']);
 const allowedStatuses = new Set(['needs_clarification', 'draft_ready', 'blocked', 'cancelled']);
 const secretPattern = /(?:sk-[A-Za-z0-9_-]{16,}|bearer\s+[A-Za-z0-9._-]{20,})/i;
@@ -7,6 +8,13 @@ const secretPattern = /(?:sk-[A-Za-z0-9_-]{16,}|bearer\s+[A-Za-z0-9._-]{20,})/i;
 export const workflowAssistantSessionVersion = 1;
 export const maxAssistantRepairAttempts = 2;
 export const maxAssistantTurns = 40;
+
+export function resolveAssistantModelTimeout(value, options = {}) {
+  const configured = Number.parseInt(String(value ?? ''), 10);
+  const fallback = 300_000;
+  const minimum = options.isTest === true ? 10 : 30_000;
+  return Number.isFinite(configured) ? Math.max(minimum, Math.min(configured, 900_000)) : fallback;
+}
 
 const text = (value, maxLength = 10_000) => typeof value === 'string' ? value.trim().slice(0, maxLength) : '';
 const strings = (value, maxItems = 24, maxLength = 500) => Array.isArray(value)
@@ -63,9 +71,26 @@ export function normalizeTaskContract(value) {
   };
 }
 
+export function inputOutputSignature(contract) {
+  const normalized = normalizeTaskContract(contract);
+  return JSON.stringify({ inputs: normalized.inputs, outputs: normalized.outputs });
+}
+
+export function inputOutputConfirmationQuestion(contract) {
+  const normalized = normalizeTaskContract(contract);
+  const typeLabel = { text: '文本', image: '图像', file: '文件', json: 'JSON' };
+  const inputs = normalized.inputs.length
+    ? normalized.inputs.map((port) => `${port.name}（${typeLabel[port.type]}${port.required ? '，必填' : ''}）`).join('、')
+    : '尚未识别到明确输入';
+  const outputs = normalized.outputs.length
+    ? normalized.outputs.map((port) => `${port.name}（${typeLabel[port.type]}${port.count ? `，${port.count} 项` : ''}）`).join('、')
+    : '尚未识别到明确输出';
+  return `请确认输入与输出：输入为「${inputs}」；输出为「${outputs}」。是否符合你的要求？`;
+}
+
 export function taskContractReady(contract) {
   const normalized = normalizeTaskContract(contract);
-  return Boolean(normalized.objective && normalized.inputs.length && normalized.outputs.length && normalized.outOfScope.length && normalized.acceptanceCriteria.length && !normalized.unresolvedQuestions.length);
+  return Boolean(normalized.objective && normalized.inputs.length && normalized.outputs.length && !normalized.unresolvedQuestions.length);
 }
 
 export function createAssistantSession(options = {}) {
@@ -90,6 +115,7 @@ export function createAssistantSession(options = {}) {
     },
     recentTurns: [],
     currentWorkflowRevision: text(options.currentWorkflowRevision, 200),
+    confirmedInputOutputSignature: '',
     repairAttempt: 0
   };
 }
@@ -135,10 +161,15 @@ export function normalizeAssistantSession(value, options = {}) {
     summary: normalizeSummary(candidate.summary),
     recentTurns: Array.isArray(candidate.recentTurns) ? candidate.recentTurns.map(normalizeTurn).filter(Boolean).slice(-maxAssistantTurns) : [],
     currentWorkflowRevision: text(candidate.currentWorkflowRevision, 200) || text(options.currentWorkflowRevision, 200),
+    confirmedInputOutputSignature: text(candidate.confirmedInputOutputSignature, 5_000),
     repairAttempt: Number.isInteger(candidate.repairAttempt) ? Math.max(0, Math.min(candidate.repairAttempt, maxAssistantRepairAttempts)) : 0
   };
-  if (candidate.candidateDraft && typeof candidate.candidateDraft === 'object') session.candidateDraft = clone(candidate.candidateDraft);
-  if (candidate.validation && typeof candidate.validation === 'object') session.validation = clone(candidate.validation);
+  if (candidate.candidateDraft?.plan?.schema === 'aiflow.workflow-plan') {
+    session.candidateDraft = clone(candidate.candidateDraft);
+    if (candidate.validation && typeof candidate.validation === 'object') session.validation = clone(candidate.validation);
+  } else if (candidate.candidateDraft) {
+    session.phase = 'discovery';
+  }
   return session;
 }
 
@@ -205,11 +236,77 @@ export function normalizeAssistantEnvelope(value) {
   if (!status) throw new Error('Assistant response has an invalid status');
   const message = text(value.message, 5_000);
   if (!message) throw new Error('Assistant response message is required');
-  const questions = strings(value.questions, 3, 500);
+  const questions = strings(value.questions, 1, 500);
   const contract = normalizeTaskContract(value.contract);
   if (status === 'needs_clarification' && !questions.length) throw new Error('Clarification response must contain questions');
   if (status === 'draft_ready' && (!value.draft || typeof value.draft !== 'object')) throw new Error('draft_ready response must contain a draft');
   return { status, message, contract, questions, ...(value.draft ? { draft: clone(value.draft) } : {}), ...(value.changeSet ? { changeSet: clone(value.changeSet) } : {}) };
+}
+
+const workflowPlan = (draft) => draft?.plan && typeof draft.plan === 'object' && !Array.isArray(draft.plan) ? draft.plan : null;
+
+const planEdgeSignature = (edge) => `${text(edge?.source, 100)}::${text(edge?.target, 100)}::${text(edge?.sourceHandle, 20)}`;
+
+export function compileWorkflowDraft(draft) {
+  if (!draft || typeof draft !== 'object' || Array.isArray(draft)) return draft;
+  const plan = workflowPlan(draft);
+  if (!plan || !Array.isArray(plan.steps) || !Array.isArray(plan.connections) || !Array.isArray(draft.nodes)) return clone(draft);
+
+  const configById = new Map(draft.nodes.flatMap((node) => node && typeof node === 'object' && typeof node.id === 'string' ? [[node.id, node]] : []));
+  const nodes = plan.steps.map((step) => {
+    const config = configById.get(step?.id) || {};
+    const configData = config.data && typeof config.data === 'object' && !Array.isArray(config.data) ? config.data : {};
+    return {
+      ...config,
+      id: step?.id,
+      type: 'flowNode',
+      position: { x: 0, y: 0 },
+      data: {
+        ...configData,
+        kind: step?.kind,
+        title: step?.title,
+        subtitle: text(configData.subtitle, 240) || text(step?.purpose, 240),
+        status: 'idle'
+      }
+    };
+  });
+  const edges = plan.connections.map((connection, index) => ({
+    id: text(connection?.id, 100) || `edge-plan-${index + 1}`,
+    source: connection?.source,
+    target: connection?.target,
+    ...(connection?.sourceHandle ? { sourceHandle: connection.sourceHandle } : {})
+  }));
+
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const incoming = new Map([...nodeIds].map((nodeId) => [nodeId, []]));
+  const outgoing = new Map([...nodeIds].map((nodeId) => [nodeId, []]));
+  for (const edge of edges) {
+    if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) continue;
+    incoming.get(edge.target).push(edge.source);
+    outgoing.get(edge.source).push(edge.target);
+  }
+  const indegree = new Map([...incoming].map(([nodeId, sources]) => [nodeId, sources.length]));
+  const depth = new Map([...nodeIds].map((nodeId) => [nodeId, 0]));
+  const queue = [...indegree.entries()].filter(([, count]) => count === 0).map(([nodeId]) => nodeId);
+  while (queue.length) {
+    const source = queue.shift();
+    for (const target of outgoing.get(source) || []) {
+      depth.set(target, Math.max(depth.get(target) || 0, (depth.get(source) || 0) + 1));
+      indegree.set(target, (indegree.get(target) || 0) - 1);
+      if (indegree.get(target) === 0) queue.push(target);
+    }
+  }
+  const layers = new Map();
+  for (const node of nodes) {
+    const layer = depth.get(node.id) || 0;
+    layers.set(layer, [...(layers.get(layer) || []), node.id]);
+  }
+  const positions = new Map();
+  for (const [layer, layerNodeIds] of layers) {
+    const totalHeight = Math.max(0, (layerNodeIds.length - 1) * 180);
+    layerNodeIds.forEach((nodeId, index) => positions.set(nodeId, { x: 80 + layer * 310, y: 220 - totalHeight / 2 + index * 180 }));
+  }
+  return { ...clone(draft), plan: clone(plan), nodes: nodes.map((node) => ({ ...node, position: positions.get(node.id) || { x: 80, y: 220 } })), edges };
 }
 
 const issue = (source, code, message, options = {}) => ({ source, severity: options.severity || 'error', code, message, ...(options.nodeId ? { nodeId: options.nodeId } : {}), ...(options.path ? { path: options.path } : {}), ...(options.evidence ? { evidence: options.evidence } : {}), ...(options.suggestedFix ? { suggestedFix: options.suggestedFix } : {}) });
@@ -221,9 +318,42 @@ export function validateWorkflowDraft(draft, options = {}) {
   if (!draft || typeof draft !== 'object' || Array.isArray(draft)) return { valid: false, issues: [issue('schema', 'DRAFT_REQUIRED', '候选工作流必须是对象')] };
   if (draft.schema !== 'aiflow.workflow-draft' || draft.schemaVersion !== 1) issues.push(issue('schema', 'DRAFT_SCHEMA_INVALID', '工作流草案 Schema 或版本无效', { path: '/schema' }));
   if (!text(draft.title, 200)) issues.push(issue('schema', 'TITLE_REQUIRED', '工作流标题不能为空', { path: '/title' }));
+  const plan = workflowPlan(draft);
+  if (!plan || plan.schema !== 'aiflow.workflow-plan' || plan.schemaVersion !== 1) issues.push(issue('plan', 'PLAN_SCHEMA_INVALID', '草案必须包含有效的 WorkflowPlan，流程图是节点和连线的唯一事实来源', { path: '/plan' }));
+  if (plan && !text(plan.summary, 1_000)) issues.push(issue('plan', 'PLAN_SUMMARY_REQUIRED', '流程方案必须包含简明的整体说明', { path: '/plan/summary' }));
+  if (plan && (!Array.isArray(plan.steps) || !plan.steps.length || plan.steps.length > 100)) issues.push(issue('plan', 'PLAN_STEPS_INVALID', '流程方案必须包含 1–100 个步骤', { path: '/plan/steps' }));
+  if (plan && (!Array.isArray(plan.connections) || plan.connections.length > 200)) issues.push(issue('plan', 'PLAN_CONNECTIONS_INVALID', '流程方案连接必须是最多 200 项的数组', { path: '/plan/connections' }));
   if (!Array.isArray(draft.nodes) || !draft.nodes.length || draft.nodes.length > 100) issues.push(issue('schema', 'NODES_INVALID', '工作流必须包含 1–100 个节点', { path: '/nodes' }));
   if (!Array.isArray(draft.edges) || draft.edges.length > 200) issues.push(issue('schema', 'EDGES_INVALID', '工作流连接必须是最多 200 项的数组', { path: '/edges' }));
-  if (issues.some((entry) => ['NODES_INVALID', 'EDGES_INVALID'].includes(entry.code))) return { valid: false, issues };
+  if (issues.some((entry) => ['PLAN_SCHEMA_INVALID', 'PLAN_STEPS_INVALID', 'PLAN_CONNECTIONS_INVALID', 'NODES_INVALID', 'EDGES_INVALID'].includes(entry.code))) return { valid: false, issues };
+
+  const planStepIds = new Set();
+  const planStepById = new Map();
+  for (const [index, step] of plan.steps.entries()) {
+    const path = `/plan/steps/${index}`;
+    if (!step || typeof step !== 'object' || !nodeIdPattern.test(step.id || '')) { issues.push(issue('plan', 'PLAN_STEP_ID_INVALID', '流程步骤 ID 必须使用小写字母、数字或连字符', { path: `${path}/id` })); continue; }
+    if (planStepIds.has(step.id)) issues.push(issue('plan', 'DUPLICATE_PLAN_STEP_ID', `流程步骤 ID 重复：${step.id}`, { nodeId: step.id }));
+    planStepIds.add(step.id);
+    planStepById.set(step.id, step);
+    if (!allowedKinds.has(step.kind)) issues.push(issue('plan', 'PLAN_STEP_KIND_INVALID', '流程步骤类型不在运行时目录中', { nodeId: step.id }));
+    if (!text(step.title, 100) || !text(step.purpose, 500)) issues.push(issue('plan', 'PLAN_STEP_EXPLANATION_REQUIRED', '每个流程步骤必须包含标题和职责说明', { nodeId: step.id }));
+    if (!Array.isArray(step.inputs) || !Array.isArray(step.outputs) || [...(step.inputs || []), ...(step.outputs || [])].some((entry) => !text(entry, 200))) issues.push(issue('plan', 'PLAN_STEP_PORTS_INVALID', '每个流程步骤必须明确输入和输出说明', { nodeId: step.id }));
+  }
+
+  const planConnectionIds = new Set();
+  const planConnectionSignatures = new Set();
+  for (const [index, connection] of plan.connections.entries()) {
+    const path = `/plan/connections/${index}`;
+    if (!connection || typeof connection !== 'object' || !nodeIdPattern.test(connection.id || '')) { issues.push(issue('plan', 'PLAN_CONNECTION_ID_INVALID', '流程连接 ID 格式无效', { path: `${path}/id` })); continue; }
+    if (planConnectionIds.has(connection.id)) issues.push(issue('plan', 'DUPLICATE_PLAN_CONNECTION_ID', `流程连接 ID 重复：${connection.id}`));
+    planConnectionIds.add(connection.id);
+    if (!planStepIds.has(connection.source) || !planStepIds.has(connection.target)) issues.push(issue('plan', 'PLAN_DANGLING_CONNECTION', `流程连接 ${connection.id} 指向不存在的步骤`, { path }));
+    if (!text(connection.reason, 500)) issues.push(issue('plan', 'PLAN_CONNECTION_REASON_REQUIRED', '每条流程连接必须说明传递内容和连接原因', { path: `${path}/reason` }));
+    if (!allowedPlanDataTypes.has(connection.dataType)) issues.push(issue('plan', 'PLAN_CONNECTION_DATA_TYPE_INVALID', '流程连接必须声明有效的数据类型', { path: `${path}/dataType` }));
+    const signature = planEdgeSignature(connection);
+    if (planConnectionSignatures.has(signature)) issues.push(issue('graph', 'DUPLICATE_LOGICAL_EDGE', `流程包含重复连接：${connection.source} → ${connection.target}`, { nodeId: connection.target }));
+    planConnectionSignatures.add(signature);
+  }
 
   const nodeIds = new Set();
   const nodeById = new Map();
@@ -233,6 +363,9 @@ export function validateWorkflowDraft(draft, options = {}) {
     if (nodeIds.has(node.id)) issues.push(issue('graph', 'DUPLICATE_NODE_ID', `节点 ID 重复：${node.id}`, { nodeId: node.id }));
     nodeIds.add(node.id);
     nodeById.set(node.id, node);
+    const planStep = planStepById.get(node.id);
+    if (!planStep) issues.push(issue('plan', 'NODE_NOT_IN_PLAN', '画布节点未在流程图中定义', { nodeId: node.id }));
+    else if (planStep.kind !== node?.data?.kind || planStep.title !== node?.data?.title) issues.push(issue('plan', 'NODE_PLAN_MISMATCH', '画布节点类型或标题与流程图步骤不一致', { nodeId: node.id }));
     if (node.type !== 'flowNode') issues.push(issue('schema', 'NODE_TYPE_INVALID', '节点 type 必须为 flowNode', { nodeId: node.id, path: `${path}/type` }));
     if (!node.position || !Number.isFinite(node.position.x) || !Number.isFinite(node.position.y)) issues.push(issue('schema', 'NODE_POSITION_INVALID', '节点位置必须包含有限数值 x/y', { nodeId: node.id, path: `${path}/position` }));
     const data = node.data;
@@ -250,17 +383,23 @@ export function validateWorkflowDraft(draft, options = {}) {
     }
     if (data.kind === 'condition' && !['contains', 'not_contains', 'equals', 'not_equals'].includes(data.conditionOperator)) issues.push(issue('node-config', 'CONDITION_OPERATOR_INVALID', '条件节点运算符无效', { nodeId: node.id }));
   }
+  plan.steps.filter((step) => !nodeIds.has(step.id)).forEach((step) => issues.push(issue('plan', 'PLAN_STEP_NOT_COMPILED', '流程图步骤未编译为画布节点', { nodeId: step.id })));
 
   const edgeIds = new Set();
   const outgoing = new Map([...nodeIds].map((nodeId) => [nodeId, []]));
   const indegree = new Map([...nodeIds].map((nodeId) => [nodeId, 0]));
   const conditionHandles = new Map();
+  const edgeSignatures = new Set();
   for (const [index, edge] of draft.edges.entries()) {
     const path = `/edges/${index}`;
     if (!edge || typeof edge !== 'object' || !nodeIdPattern.test(edge.id || '')) { issues.push(issue('schema', 'EDGE_ID_INVALID', '连接 ID 格式无效', { path: `${path}/id` })); continue; }
     if (edgeIds.has(edge.id)) issues.push(issue('graph', 'DUPLICATE_EDGE_ID', `连接 ID 重复：${edge.id}`));
     edgeIds.add(edge.id);
     if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) { issues.push(issue('graph', 'DANGLING_EDGE', `连接 ${edge.id} 指向不存在的节点`, { path })); continue; }
+    const signature = planEdgeSignature(edge);
+    if (edgeSignatures.has(signature)) issues.push(issue('graph', 'DUPLICATE_LOGICAL_EDGE', `画布包含重复连接：${edge.source} → ${edge.target}`, { nodeId: edge.target }));
+    edgeSignatures.add(signature);
+    if (!planConnectionSignatures.has(signature)) issues.push(issue('plan', 'EDGE_NOT_IN_PLAN', '画布连接未在流程图中定义', { path }));
     const sourceKind = nodeById.get(edge.source)?.data?.kind;
     if (sourceKind === 'condition' && !['true', 'false'].includes(edge.sourceHandle)) issues.push(issue('graph', 'CONDITION_HANDLE_INVALID', '条件节点连接必须指定 true 或 false 出口', { nodeId: edge.source }));
     else if (sourceKind === 'condition') conditionHandles.set(edge.source, new Set([...(conditionHandles.get(edge.source) || []), edge.sourceHandle]));
@@ -268,6 +407,7 @@ export function validateWorkflowDraft(draft, options = {}) {
     outgoing.get(edge.source).push(edge.target);
     indegree.set(edge.target, indegree.get(edge.target) + 1);
   }
+  plan.connections.filter((connection) => !edgeSignatures.has(planEdgeSignature(connection))).forEach((connection) => issues.push(issue('plan', 'PLAN_CONNECTION_NOT_COMPILED', '流程图连接未编译为画布连线', { nodeId: connection.target })));
 
   const starts = draft.nodes.filter((node) => node?.data?.kind === 'start');
   const outputs = draft.nodes.filter((node) => node?.data?.kind === 'output');
@@ -275,6 +415,8 @@ export function validateWorkflowDraft(draft, options = {}) {
   if (!outputs.length) issues.push(issue('graph', 'OUTPUT_REQUIRED', '工作流至少需要一个结束节点'));
   starts.filter((node) => (indegree.get(node.id) || 0) > 0).forEach((node) => issues.push(issue('graph', 'START_HAS_INCOMING', '开始节点不能有入边', { nodeId: node.id })));
   outputs.filter((node) => (outgoing.get(node.id) || []).length > 0).forEach((node) => issues.push(issue('graph', 'OUTPUT_HAS_OUTGOING', '结束节点不能有出边', { nodeId: node.id })));
+  draft.nodes.filter((node) => ['llm', 'image', 'condition', 'http', 'code'].includes(node?.data?.kind) && (indegree.get(node.id) || 0) > 1).forEach((node) => issues.push(issue('graph', 'MULTIPLE_PRIMARY_INPUTS', '普通处理节点只能有一个主上游；请先使用聚合节点合并输入', { nodeId: node.id })));
+  outputs.filter((node) => (indegree.get(node.id) || 0) > 1).forEach((node) => issues.push(issue('graph', 'OUTPUT_REQUIRES_AGGREGATE', '多个分支必须先经过聚合节点，再连接结束节点', { nodeId: node.id })));
   draft.nodes.filter((node) => node?.data?.kind === 'condition').forEach((node) => {
     const handles = conditionHandles.get(node.id) || new Set();
     if (!handles.has('true') || !handles.has('false')) issues.push(issue('graph', 'CONDITION_BRANCH_INCOMPLETE', '条件节点必须同时连接 true 与 false 分支', { nodeId: node.id }));
@@ -292,6 +434,25 @@ export function validateWorkflowDraft(draft, options = {}) {
   }
   if (sorted !== nodeIds.size) issues.push(issue('graph', 'CYCLE_DETECTED', '工作流包含环路'));
 
+  for (const edge of draft.edges) {
+    if (!nodeIds.has(edge?.source) || !nodeIds.has(edge?.target)) continue;
+    const excluded = planEdgeSignature(edge);
+    const pending = [edge.source];
+    const visited = new Set();
+    let hasAlternativePath = false;
+    while (pending.length && !hasAlternativePath) {
+      const current = pending.shift();
+      if (visited.has(current)) continue;
+      visited.add(current);
+      for (const candidate of draft.edges) {
+        if (candidate?.source !== current || planEdgeSignature(candidate) === excluded) continue;
+        if (candidate.target === edge.target) { hasAlternativePath = true; break; }
+        pending.push(candidate.target);
+      }
+    }
+    if (hasAlternativePath) issues.push(issue('graph', 'REDUNDANT_TRANSITIVE_EDGE', `连接 ${edge.source} → ${edge.target} 存在其他完整路径，会造成逻辑重复`, { nodeId: edge.target }));
+  }
+
   if (starts.length === 1) {
     const reachable = new Set();
     const pending = [starts[0].id];
@@ -303,6 +464,20 @@ export function validateWorkflowDraft(draft, options = {}) {
     }
     draft.nodes.filter((node) => !reachable.has(node.id)).forEach((node) => issues.push(issue('graph', 'NODE_UNREACHABLE', '节点无法从开始节点到达', { nodeId: node.id })));
     outputs.filter((node) => !reachable.has(node.id)).forEach((node) => issues.push(issue('graph', 'OUTPUT_UNREACHABLE', '结束节点无法从开始节点到达', { nodeId: node.id })));
+  }
+
+  if (outputs.length) {
+    const reverse = new Map([...nodeIds].map((nodeId) => [nodeId, []]));
+    for (const edge of draft.edges) if (reverse.has(edge?.target) && nodeIds.has(edge?.source)) reverse.get(edge.target).push(edge.source);
+    const canReachOutput = new Set();
+    const pending = outputs.map((node) => node.id);
+    while (pending.length) {
+      const current = pending.shift();
+      if (canReachOutput.has(current)) continue;
+      canReachOutput.add(current);
+      for (const source of reverse.get(current) || []) pending.push(source);
+    }
+    draft.nodes.filter((node) => !canReachOutput.has(node.id)).forEach((node) => issues.push(issue('graph', 'NODE_CANNOT_REACH_OUTPUT', '节点结果无法到达任何结束节点', { nodeId: node.id })));
   }
 
   const modelCalls = draft.nodes.filter((node) => node?.data?.kind === 'llm').length;

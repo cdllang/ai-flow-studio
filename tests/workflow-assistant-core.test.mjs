@@ -5,8 +5,11 @@ import { loadWorkflowAssistantSkill } from '../system-skill-loader.mjs';
 import {
   addSessionTurn,
   applySessionCompression,
+  compileWorkflowDraft,
   createAssistantSession,
   extractJsonObject,
+  inputOutputConfirmationQuestion,
+  inputOutputSignature,
   normalizeAssistantEnvelope,
   normalizeTaskContract,
   shouldCompressSession,
@@ -40,6 +43,22 @@ const validDraft = () => ({
   schema: 'aiflow.workflow-draft',
   schemaVersion: 1,
   title: '商品内容生成',
+  plan: {
+    schema: 'aiflow.workflow-plan',
+    schemaVersion: 1,
+    summary: '根据商品说明先生成文案，再生成两张图片并统一输出。',
+    steps: [
+      { id: 'start-1', kind: 'start', title: '开始', purpose: '接收商品说明', inputs: [], outputs: ['商品说明'] },
+      { id: 'llm-1', kind: 'llm', title: '生成文案', purpose: '根据商品说明生成商品文案', inputs: ['商品说明'], outputs: ['商品文案'] },
+      { id: 'image-1', kind: 'image', title: '生成图片', purpose: '根据商品文案生成两张商品图片', inputs: ['商品文案'], outputs: ['商品图片'] },
+      { id: 'output-1', kind: 'output', title: '输出', purpose: '交付图片和文案', inputs: ['商品图片', '商品文案'], outputs: [] }
+    ],
+    connections: [
+      { id: 'edge-start-llm', source: 'start-1', target: 'llm-1', reason: '传递商品说明', dataType: 'text' },
+      { id: 'edge-llm-image', source: 'llm-1', target: 'image-1', reason: '传递商品文案作为生图提示', dataType: 'text' },
+      { id: 'edge-image-output', source: 'image-1', target: 'output-1', reason: '交付生成图片和关联文案', dataType: 'mixed' }
+    ]
+  },
   nodes: [
     { id: 'start-1', type: 'flowNode', position: { x: 80, y: 160 }, data: { kind: 'start', title: '开始', subtitle: '商品说明', status: 'idle' } },
     { id: 'llm-1', type: 'flowNode', position: { x: 360, y: 160 }, data: { kind: 'llm', title: '生成文案', subtitle: 'text-model', status: 'idle', providerId: 'provider-main', model: 'text-model', prompt: '生成商品文案' } },
@@ -53,10 +72,21 @@ const validDraft = () => ({
   ]
 });
 
-test('task contract blocks drafting until objective, boundaries, inputs, outputs and acceptance criteria are complete', () => {
+test('task contract only blocks drafting on objective, inputs, outputs and unresolved input/output confirmation', () => {
   assert.equal(taskContractReady(contract), true);
-  assert.equal(taskContractReady({ ...contract, acceptanceCriteria: [] }), false);
+  assert.equal(taskContractReady({ ...contract, outOfScope: [], acceptanceCriteria: [] }), true);
+  assert.equal(taskContractReady({ ...contract, inputs: [] }), false);
   assert.equal(taskContractReady({ ...contract, unresolvedQuestions: ['还缺目标平台'] }), false);
+});
+
+test('input/output confirmation is deterministic and excludes unrelated contract fields', () => {
+  const signature = inputOutputSignature(contract);
+  const question = inputOutputConfirmationQuestion(contract);
+  assert.match(question, /输入为「商品说明（文本，必填）」/);
+  assert.match(question, /输出为「文案（文本）、图片（图像，2 项）」/);
+  assert.doesNotMatch(question, /自动发布|预算|HTTP|验收/);
+  assert.equal(signature, inputOutputSignature({ ...contract, outOfScope: ['改成其他边界'], acceptanceCriteria: [] }));
+  assert.notEqual(signature, inputOutputSignature({ ...contract, outputs: [{ name: 'JSON', type: 'json' }] }));
 });
 
 test('assistant envelope accepts clarification or draft and rejects ambiguous model output', () => {
@@ -87,7 +117,7 @@ test('session compression triggers after 12 turns and preserves the latest six t
 });
 
 test('deterministic validator accepts a catalog-bound safe DAG and reports critic warnings separately', () => {
-  const deterministic = validateWorkflowDraft(validDraft(), { providers, constraints: contract.constraints });
+  const deterministic = validateWorkflowDraft(compileWorkflowDraft(validDraft()), { providers, constraints: contract.constraints });
   assert.deepEqual(deterministic, { valid: true, issues: [] });
   const report = validationReport(deterministic, [{ severity: 'warning', code: 'COPY_TONE', message: '语气仍可更明确', nodeId: 'llm-1', evidence: 'acceptance criteria' }], 0);
   assert.equal(report.valid, true);
@@ -100,8 +130,10 @@ test('deterministic validator rejects unsafe nodes, invalid providers, budgets, 
   draft.nodes[1].data.providerId = 'missing-provider';
   draft.nodes[1].data.prompt = `Use ${'sk-'}${'1234567890abcdefghijklmnop'}`;
   draft.nodes.splice(2, 0, { id: 'http-1', type: 'flowNode', position: { x: 500, y: 300 }, data: { kind: 'http', title: '发布', subtitle: '外部接口', status: 'idle' } });
-  draft.edges.push({ id: 'edge-cycle', source: 'output-1', target: 'llm-1' });
-  const result = validateWorkflowDraft(draft, { providers, constraints: { ...contract.constraints, maxModelCalls: 0 } });
+  draft.plan.steps.splice(2, 0, { id: 'http-1', kind: 'http', title: '发布', purpose: '调用外部接口', inputs: ['商品文案'], outputs: ['发布结果'] });
+  draft.plan.connections.push({ id: 'edge-cycle', source: 'output-1', target: 'llm-1', reason: '错误的循环连接', dataType: 'text' });
+  const compiled = compileWorkflowDraft(draft);
+  const result = validateWorkflowDraft(compiled, { providers, constraints: { ...contract.constraints, maxModelCalls: 0 } });
   assert.equal(result.valid, false);
   const codes = new Set(result.issues.map((entry) => entry.code));
   ['PROVIDER_NOT_FOUND', 'HTTP_NOT_AUTHORIZED', 'MODEL_CALL_BUDGET_EXCEEDED', 'CYCLE_DETECTED', 'SECRET_DETECTED'].forEach((code) => assert.equal(codes.has(code), true, code));
@@ -110,13 +142,39 @@ test('deterministic validator rejects unsafe nodes, invalid providers, budgets, 
 test('deterministic validator rejects stale graph shapes that could silently drop branches', () => {
   const draft = validDraft();
   draft.nodes[1].data = { kind: 'condition', title: '判断渠道', subtitle: '仅连接真分支', status: 'idle', conditionOperator: 'contains' };
-  draft.edges[1].sourceHandle = 'true';
+  draft.plan.steps[1] = { ...draft.plan.steps[1], kind: 'condition', title: '判断渠道' };
+  draft.plan.connections[1].sourceHandle = 'true';
   draft.nodes.push({ id: 'unused-1', type: 'flowNode', position: { x: 640, y: 360 }, data: { kind: 'aggregate', title: '未使用聚合', subtitle: '不可达', status: 'idle' } });
-  draft.edges.push({ id: 'edge-output-unused', source: 'output-1', target: 'unused-1' });
-  const result = validateWorkflowDraft(draft, { providers, constraints: contract.constraints });
+  draft.plan.steps.push({ id: 'unused-1', kind: 'aggregate', title: '未使用聚合', purpose: '错误的输出后节点', inputs: ['输出'], outputs: ['聚合'] });
+  draft.plan.connections.push({ id: 'edge-output-unused', source: 'output-1', target: 'unused-1', reason: '错误连接', dataType: 'mixed' });
+  const result = validateWorkflowDraft(compileWorkflowDraft(draft), { providers, constraints: contract.constraints });
   const codes = new Set(result.issues.map((entry) => entry.code));
   assert.equal(codes.has('CONDITION_BRANCH_INCOMPLETE'), true);
   assert.equal(codes.has('OUTPUT_HAS_OUTGOING'), true);
+});
+
+test('WorkflowPlan is the sole graph source and compiler ignores model-authored positions and edges', () => {
+  const draft = validDraft();
+  draft.nodes[0].position = { x: 9999, y: 9999 };
+  draft.edges.push({ id: 'edge-invented', source: 'start-1', target: 'image-1' });
+  const compiled = compileWorkflowDraft(draft);
+  assert.deepEqual(compiled.edges.map(({ source, target }) => [source, target]), draft.plan.connections.map(({ source, target }) => [source, target]));
+  assert.notDeepEqual(compiled.nodes[0].position, { x: 9999, y: 9999 });
+  assert.deepEqual(new Set(compiled.nodes.map((node) => node.id)), new Set(draft.plan.steps.map((step) => step.id)));
+  assert.equal(validateWorkflowDraft(compiled, { providers, constraints: contract.constraints }).valid, true);
+});
+
+test('deterministic validator rejects duplicate, redundant and ambiguous plan connections', () => {
+  const draft = validDraft();
+  draft.plan.connections.push(
+    { ...draft.plan.connections[0], id: 'edge-start-llm-copy' },
+    { id: 'edge-start-image', source: 'start-1', target: 'image-1', reason: '重复跨级传递商品说明', dataType: 'text' }
+  );
+  const result = validateWorkflowDraft(compileWorkflowDraft(draft), { providers, constraints: contract.constraints });
+  const codes = new Set(result.issues.map((entry) => entry.code));
+  assert.equal(codes.has('DUPLICATE_LOGICAL_EDGE'), true);
+  assert.equal(codes.has('REDUNDANT_TRANSITIVE_EDGE'), true);
+  assert.equal(codes.has('MULTIPLE_PRIMARY_INPUTS'), true);
 });
 
 test('system workflow Skill is loaded from the private system-skills tree', () => {

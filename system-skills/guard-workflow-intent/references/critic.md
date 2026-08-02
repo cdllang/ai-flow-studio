@@ -14,7 +14,9 @@ Accept only the confirmed `TaskContract`, candidate workflow, current workflow w
 4. Check that prompts can obtain every variable they reference.
 5. Detect destructive scope expansion, unauthorized HTTP/code behavior, invented providers/models/Skills, and unnecessary model calls.
 6. For adjustments, verify that unrelated valid behavior is preserved.
-7. Reject vague evidence such as “looks correct”. Cite node IDs, edge IDs, contract fields, or deterministic facts.
+7. Verify that the plan is minimal and readable: no duplicate edge, no redundant transitive edge, no unexplained connection, and no ordinary processing node with multiple primary upstreams.
+8. Verify that every canvas node and connection can be traced to the supplied WorkflowPlan, and that every plan step contributes to a reachable output.
+9. Reject vague evidence such as “looks correct”. Cite node IDs, connection IDs, contract fields, or deterministic facts.
 
 ## Output
 
