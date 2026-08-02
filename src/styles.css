@@ -423,6 +423,7 @@ button svg { flex: 0 0 auto; }
 .provider-model-head small { margin-top: 4px; color: var(--muted); font-size: 8px; }
 .provider-model-head b { color: var(--blue); font-size: 9px; }
 .provider-model-add { display: grid; grid-template-columns: 120px minmax(0,1fr) auto; margin-top: 12px; gap: 7px; }
+.provider-model-add.has-protocol { grid-template-columns: 120px 220px minmax(0,1fr) auto; }
 .provider-model-add select, .provider-model-add input { min-width: 0; min-height: 36px; padding: 0 9px; color: var(--text); background: #11100e; border: 1px solid var(--line); border-radius: 6px; outline: 0; font-size: 9px; }
 .provider-model-add select:focus, .provider-model-add input:focus { border-color: rgba(86,136,255,.48); }
 .provider-model-add button { display: inline-flex; min-height: 36px; align-items: center; padding: 0 11px; gap: 5px; color: var(--soft); background: rgba(86,136,255,.1); border: 1px solid rgba(86,136,255,.24); border-radius: 6px; font-size: 8px; font-weight: 800; }
@@ -579,6 +580,7 @@ button svg { flex: 0 0 auto; }
   .provider-workbench { grid-template-columns: 1fr; }
   .provider-list { border-right: 0; border-bottom: 1px solid var(--line); }
   .provider-form-grid, .provider-model-list { grid-template-columns: 1fr; }
+  .provider-model-add, .provider-model-add.has-protocol { grid-template-columns: 1fr; }
   .provider-form-grid .provider-key-field, .provider-model-empty { grid-column: auto; }
 }
 

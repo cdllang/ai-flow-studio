@@ -19,7 +19,7 @@ test('legacy browser credentials migrate into gateway-bound provider connections
     imageModel: 'image-a'
   });
   assert.deepEqual(store.providers.map((provider) => ({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, models: provider.models })), [
-    { baseUrl: 'https://chat.example.com/v1', apiKey: 'chat-secret', models: [{ id: 'chat-a', capability: 'chat' }] },
+    { baseUrl: 'https://chat.example.com/v1', apiKey: 'chat-secret', models: [{ id: 'chat-a', capability: 'chat', protocol: 'chat-completions' }] },
     { baseUrl: 'https://image.example.com/v1', apiKey: 'image-secret', models: [{ id: 'image-a', capability: 'image' }] }
   ]);
 });
@@ -33,6 +33,7 @@ test('provider normalization keeps user-added mixed model lists and removes dupl
     models: [
       { id: 'chat-pro', capability: 'chat' },
       { id: 'chat-pro', capability: 'chat' },
+      { id: 'reasoning-pro', capability: 'chat', protocol: 'responses' },
       { id: 'image-pro', capability: 'image' }
     ]
   }] });
@@ -41,8 +42,23 @@ test('provider normalization keeps user-added mixed model lists and removes dupl
     name: 'Vendor A',
     baseUrl: 'https://vendor.example.com/v1',
     apiKey: 'secret',
-    models: [{ id: 'chat-pro', capability: 'chat' }, { id: 'image-pro', capability: 'image' }]
+    models: [
+      { id: 'chat-pro', capability: 'chat', protocol: 'chat-completions' },
+      { id: 'reasoning-pro', capability: 'chat', protocol: 'responses' },
+      { id: 'image-pro', capability: 'image' }
+    ]
   });
+});
+
+test('unknown or missing text protocols safely fall back to chat completions', () => {
+  const store = normalizeProviderStore({ schemaVersion: 1, providers: [{
+    id: 'vendor', name: 'Vendor', baseUrl: 'https://vendor.example/v1', apiKey: 'secret', models: [
+      { id: 'legacy-chat', capability: 'chat' },
+      { id: 'unknown-chat', capability: 'chat', protocol: 'custom' },
+      { id: 'responses-chat', capability: 'chat', protocol: 'responses' }
+    ]
+  }] });
+  assert.deepEqual(store.providers[0].models.map((model) => model.protocol), ['chat-completions', 'chat-completions', 'responses']);
 });
 
 test('nodes resolve their selected key and model instead of a global credential', () => {

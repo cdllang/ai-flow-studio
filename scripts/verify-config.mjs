@@ -45,6 +45,7 @@ await page.getByRole('button', { name: '添加供应商' }).click();
 await page.getByRole('textbox', { name: '供应商名称' }).fill('双能力供应商');
 await page.getByRole('textbox', { name: '供应商 Base URL' }).fill('https://vendor.example.com/openai/v1/');
 await page.getByLabel('供应商 API Key').fill('vendor-combined-key');
+await page.getByRole('combobox', { name: '文本接口协议' }).selectOption('responses');
 await page.getByRole('textbox', { name: '新增模型 ID' }).fill('vendor-chat-pro');
 await page.getByRole('button', { name: '添加模型' }).click();
 await page.getByRole('combobox', { name: '模型能力' }).selectOption('image');
@@ -52,6 +53,7 @@ await page.getByRole('textbox', { name: '新增模型 ID' }).fill('vendor-image-
 await page.getByRole('button', { name: '添加模型' }).click();
 await page.getByRole('button', { name: '保存连接' }).click();
 await page.getByText('供应商连接已保存').waitFor();
+await page.getByRole('combobox', { name: '模型能力' }).selectOption('chat');
 await page.screenshot({ path: path.join(screenshotDir, 'provider-manager.png'), fullPage: true });
 await page.setViewportSize({ width: 1024, height: 900 });
 await page.waitForTimeout(200);
@@ -88,12 +90,13 @@ const result = {
     && migration.legacyRemoved,
   providerBoundStorage: storedProvider?.baseUrl === 'https://vendor.example.com/openai/v1'
     && storedProvider?.apiKey === 'vendor-combined-key'
-    && storedProvider?.models?.some((model) => model.id === 'vendor-chat-pro' && model.capability === 'chat')
+    && storedProvider?.models?.some((model) => model.id === 'vendor-chat-pro' && model.capability === 'chat' && model.protocol === 'responses')
     && storedProvider?.models?.some((model) => model.id === 'vendor-image-pro' && model.capability === 'image'),
   chatNodeUsesSelectedProvider: requests.some((request) => request.type === 'chat'
     && request.key === 'vendor-combined-key'
     && request.body.baseUrl === 'https://vendor.example.com/openai/v1'
-    && request.body.model === 'vendor-chat-pro'),
+    && request.body.model === 'vendor-chat-pro'
+    && request.body.protocol === 'responses'),
   imageNodeUsesSelectedProvider: requests.some((request) => request.type === 'image'
     && request.key === 'vendor-combined-key'
     && request.body.baseUrl === 'https://vendor.example.com/openai/v1'

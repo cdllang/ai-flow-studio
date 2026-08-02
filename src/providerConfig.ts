@@ -1,10 +1,12 @@
 import { fallbackModelConfig, type ModelConnectionConfig } from './modelConfig.ts';
 
 export type ModelCapability = 'chat' | 'image';
+export type ChatApiProtocol = 'chat-completions' | 'responses';
 
 export type ProviderModel = {
   id: string;
   capability: ModelCapability;
+  protocol?: ChatApiProtocol;
 };
 
 export type ModelProvider = {
@@ -43,7 +45,8 @@ const cleanModels = (value: unknown): ProviderModel[] => {
     const key = `${capability}:${id}`;
     if (seen.has(key)) return;
     seen.add(key);
-    models.push({ id, capability });
+    const protocol = capability === 'chat' && candidate.protocol === 'responses' ? 'responses' : 'chat-completions';
+    models.push(capability === 'chat' ? { id, capability, protocol } : { id, capability });
   });
   return models;
 };
@@ -59,7 +62,7 @@ export function createLegacyProviders(
       name: '默认基础模型服务',
       baseUrl: cleanUrl(legacy.chatBaseUrl || legacyUrl, defaults.chatBaseUrl),
       apiKey: typeof legacy.chatApiKey === 'string' ? legacy.chatApiKey.trim() : '',
-      models: [{ id: String(legacy.chatModel || defaults.chatModel).trim(), capability: 'chat' }]
+      models: [{ id: String(legacy.chatModel || defaults.chatModel).trim(), capability: 'chat', protocol: 'chat-completions' }]
     },
     {
       id: 'provider-default-image',

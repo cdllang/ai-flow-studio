@@ -42,6 +42,19 @@ const requestModel = (value, fallback) => {
   if (typeof value !== 'string' || !value.trim() || value.length > 200) throw new Error('模型名称不能为空且不能超过 200 个字符');
   return value.trim();
 };
+const requestChatProtocol = (value) => {
+  if (value === undefined || value === null || value === '') return 'chat-completions';
+  if (value !== 'chat-completions' && value !== 'responses') throw new Error('文本接口协议仅支持 chat-completions 或 responses');
+  return value;
+};
+const responseOutputText = (data) => {
+  if (typeof data?.output_text === 'string') return data.output_text;
+  if (!Array.isArray(data?.output)) return '';
+  return data.output.flatMap((item) => Array.isArray(item?.content) ? item.content : [])
+    .map((content) => typeof content?.text === 'string' ? content.text : typeof content?.refusal === 'string' ? content.refusal : '')
+    .filter(Boolean)
+    .join('\n');
+};
 const publicConfig = () => ({
   baseUrl,
   chatBaseUrl,
@@ -70,34 +83,42 @@ app.post('/api/chat', async (req, res) => {
     return res.status(503).json({ code: 'CHAT_KEY_MISSING', message: '基础模型 Key 未配置', requestId: id });
   }
 
-  const { prompt, system, model, baseUrl: customBaseUrl, temperature = 0.7 } = req.body ?? {};
+  const { prompt, system, model, baseUrl: customBaseUrl, protocol, temperature } = req.body ?? {};
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ code: 'PROMPT_REQUIRED', message: '请输入提示词', requestId: id });
   }
 
   let upstreamBaseUrl;
   let upstreamModel;
+  let upstreamProtocol;
   try {
     upstreamBaseUrl = requestBaseUrl(customBaseUrl, chatBaseUrl);
     upstreamModel = requestModel(model, defaultChatModel);
+    upstreamProtocol = requestChatProtocol(protocol);
   } catch (error) {
     return res.status(400).json({ code: 'MODEL_CONFIG_INVALID', message: safeError(error), requestId: id });
   }
 
   try {
-    const response = await fetch(`${upstreamBaseUrl}/chat/completions`, {
+    const response = await fetch(`${upstreamBaseUrl}/${upstreamProtocol === 'responses' ? 'responses' : 'chat/completions'}`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${chatApiKey}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
+      body: JSON.stringify(upstreamProtocol === 'responses' ? {
+        model: upstreamModel,
+        input: prompt,
+        ...(system ? { instructions: String(system) } : {}),
+        ...(typeof temperature === 'number' ? { temperature } : {}),
+        stream: false
+      } : {
         model: upstreamModel,
         messages: [
           ...(system ? [{ role: 'system', content: String(system) }] : []),
           { role: 'user', content: prompt }
         ],
-        temperature,
+        temperature: typeof temperature === 'number' ? temperature : 0.7,
         stream: false
       })
     });
@@ -110,9 +131,10 @@ app.post('/api/chat', async (req, res) => {
       });
     }
     return res.json({
-      text: data?.choices?.[0]?.message?.content ?? '',
+      text: upstreamProtocol === 'responses' ? responseOutputText(data) : data?.choices?.[0]?.message?.content ?? '',
       usage: data?.usage ?? null,
       model: data?.model || upstreamModel,
+      protocol: upstreamProtocol,
       requestId: id
     });
   } catch (error) {

@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import {
   keyHint,
+  type ChatApiProtocol,
   type ModelCapability,
   type ModelProvider,
   type ProviderModel
@@ -41,6 +42,7 @@ export function ProviderManager({ providers, onSave, onDelete }: ProviderManager
   const [draft, setDraft] = useState<ModelProvider>(() => providers[0] ? cloneProvider(providers[0]) : blankProvider());
   const [modelId, setModelId] = useState('');
   const [modelCapability, setModelCapability] = useState<ModelCapability>('chat');
+  const [modelProtocol, setModelProtocol] = useState<ChatApiProtocol>('chat-completions');
   const [showKey, setShowKey] = useState(false);
   const [deleteArmed, setDeleteArmed] = useState(false);
   const [message, setMessage] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
@@ -79,7 +81,10 @@ export function ProviderManager({ providers, onSave, onDelete }: ProviderManager
     const id = modelId.trim();
     if (!id) return setMessage({ kind: 'error', text: '请填写模型 ID' });
     if (draft.models.some((model) => model.id === id && model.capability === modelCapability)) return setMessage({ kind: 'error', text: '该类型下已存在同名模型' });
-    setDraft((value) => ({ ...value, models: [...value.models, { id, capability: modelCapability }] }));
+    const model: ProviderModel = modelCapability === 'chat'
+      ? { id, capability: modelCapability, protocol: modelProtocol }
+      : { id, capability: modelCapability };
+    setDraft((value) => ({ ...value, models: [...value.models, model] }));
     setModelId('');
     setMessage(null);
   };
@@ -142,14 +147,15 @@ export function ProviderManager({ providers, onSave, onDelete }: ProviderManager
 
         <div className="provider-model-section">
           <div className="provider-model-head"><div><strong>此 Key 支持的模型</strong><small>模型由用户维护，节点只显示这里声明的模型</small></div><b>{draft.models.length} 个</b></div>
-          <div className="provider-model-add">
+          <div className={`provider-model-add ${modelCapability === 'chat' ? 'has-protocol' : ''}`}>
             <select aria-label="模型能力" value={modelCapability} onChange={(event) => setModelCapability(event.target.value as ModelCapability)}><option value="chat">文本模型</option><option value="image">图像模型</option></select>
+            {modelCapability === 'chat' && <select aria-label="文本接口协议" value={modelProtocol} onChange={(event) => setModelProtocol(event.target.value as ChatApiProtocol)}><option value="chat-completions">Chat Completions · /chat/completions</option><option value="responses">Responses · /responses</option></select>}
             <input aria-label="新增模型 ID" value={modelId} onChange={(event) => setModelId(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addModel(); } }} placeholder="模型 ID，例如 gpt-5.4-mini" />
             <button type="button" onClick={addModel}><Plus size={14} />添加模型</button>
           </div>
           <div className="provider-model-list">
             {draft.models.length ? draft.models.map((model) => <div key={`${model.capability}:${model.id}`} className={model.capability === 'image' ? 'warm' : ''}>
-              <span>{model.capability === 'image' ? <ImageIcon size={14} /> : <Bot size={14} />}</span><div><strong>{model.id}</strong><small>{model.capability === 'image' ? '图像生成' : '文本 / 推理'}</small></div><button type="button" aria-label={`删除模型 ${model.id}`} onClick={() => removeModel(model)}><X size={14} /></button>
+              <span>{model.capability === 'image' ? <ImageIcon size={14} /> : <Bot size={14} />}</span><div><strong>{model.id}</strong><small>{model.capability === 'image' ? '图像生成' : model.protocol === 'responses' ? '文本 / 推理 · /responses' : '文本 / 推理 · /chat/completions'}</small></div><button type="button" aria-label={`删除模型 ${model.id}`} onClick={() => removeModel(model)}><X size={14} /></button>
             </div>) : <div className="provider-model-empty">尚未添加模型；至少添加一个模型后才能保存</div>}
           </div>
         </div>

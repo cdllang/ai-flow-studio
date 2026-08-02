@@ -12,11 +12,11 @@
 - JavaScript 代码节点：独立 Web Worker、5 秒超时
 - 本地运行记录、版本发布与版本恢复
 - 800ms 防抖保存到浏览器 `localStorage`
-- 基础模型真实调用：OpenAI 兼容 `/chat/completions`
+- 基础模型真实调用：同时兼容 OpenAI `/chat/completions` 与 `/responses`
 - GPT Image 2 标准调用：OpenAI 兼容 `/images/generations`
 - 节点级运行日志、最终输出、错误状态和品牌演示素材回退
 - 独立“模型服务”页面：可新增多个供应商连接，并将 Base URL、API Key 与用户维护的模型清单成组保存
-- 同一供应商 Key 可声明多个文本/图像模型；每个大模型与图像节点可分别选择供应商连接和模型
+- 同一供应商 Key 可声明多个文本/图像模型；文本模型逐个绑定 Chat Completions 或 Responses 协议，每个大模型与图像节点可分别选择供应商连接和模型
 - 旧版基础模型/图像模型配置自动迁移为两条供应商连接
 - 供应商连接与 Key 暂时只保存在当前浏览器的 `localStorage`，服务端不落盘
 - 多输出结果集合：同一次运行可同时保留多份文案、多张图片、JSON 和文件
@@ -40,7 +40,7 @@ pnpm verify:partial-failure
 pnpm verify:multi-output
 ```
 
-21 项单元测试覆盖多供应商迁移/解析、多输出规范化、业务绑定、条件多值、DAG 校验、导入导出和预设 ID 重映射。浏览器回归覆盖供应商管理与节点绑定、部分失败保全、多图与对应文案、复制/下载、图库键盘操作、图片比例、删除/撤销、停止运行和条件分支。
+22 项单元测试覆盖 Chat Completions/Responses 协议转换、多供应商迁移/解析、多输出规范化、业务绑定、条件多值、DAG 校验、导入导出和预设 ID 重映射。浏览器回归覆盖供应商管理与节点绑定、部分失败保全、多图与对应文案、复制/下载、图库键盘操作、图片比例、删除/撤销、停止运行和条件分支。
 
 “AI 辅助构建工作流”当前只完成技术选型与实现方案，尚未实现，详见 [`AI_WORKFLOW_ASSISTANT_DESIGN.md`](AI_WORKFLOW_ASSISTANT_DESIGN.md)。
 
@@ -73,7 +73,7 @@ docker compose up -d
 
 ## 配置
 
-启动后打开顶部“模型服务”，新增或编辑供应商连接。每条连接同时保存 Base URL、API Key 和此 Key 支持的模型清单，模型需标注为“文本模型”或“图像模型”。回到编排页后，在每个大模型/图像节点中选择对应供应商连接与模型。
+启动后打开顶部“模型服务”，新增或编辑供应商连接。每条连接同时保存 Base URL、API Key 和此 Key 支持的模型清单，模型需标注为“文本模型”或“图像模型”。新增文本模型时还需选择 `Chat Completions · /chat/completions` 或 `Responses · /responses`；旧配置默认使用 Chat Completions。回到编排页后，在每个大模型/图像节点中选择对应供应商连接与模型。
 
 文字和图像请求只携带该节点绑定连接的 Base URL、API Key 与模型。旧版浏览器中的基础模型/图像模型配置会自动迁移为两条供应商连接。正式生产建议将浏览器凭证迁移到 Secret Manager。
 

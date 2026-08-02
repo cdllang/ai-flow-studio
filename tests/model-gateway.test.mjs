@@ -29,6 +29,14 @@ test('gateway forwards chat and image requests to separate browser-selected supp
       response.end(JSON.stringify({ choices: [{ message: { content: 'custom chat ok' } }], model: body.model }));
       return;
     }
+    if (request.url === '/chat-provider/v1/responses') {
+      response.end(JSON.stringify({
+        output: [{ type: 'message', content: [{ type: 'output_text', text: 'custom responses ok' }] }],
+        usage: { input_tokens: 4, output_tokens: 5, total_tokens: 9 },
+        model: body.model
+      }));
+      return;
+    }
     response.statusCode = 404;
     response.end(JSON.stringify({ error: { message: 'not found' } }));
   });
@@ -72,7 +80,22 @@ test('gateway forwards chat and image requests to separate browser-selected supp
       body: JSON.stringify({ prompt: 'hello', baseUrl: chatBaseUrl, model: 'merchant-chat-v2' })
     });
     assert.equal(chat.status, 200);
-    assert.equal((await chat.json()).model, 'merchant-chat-v2');
+    const chatData = await chat.json();
+    assert.equal(chatData.model, 'merchant-chat-v2');
+    assert.equal(chatData.protocol, 'chat-completions');
+    assert.equal(chatData.text, 'custom chat ok');
+
+    const responses = await fetch(`${origin}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': 'test-chat-key' },
+      body: JSON.stringify({ prompt: 'reason about this', system: 'be precise', baseUrl: chatBaseUrl, model: 'merchant-reasoner-v1', protocol: 'responses' })
+    });
+    assert.equal(responses.status, 200);
+    const responsesData = await responses.json();
+    assert.equal(responsesData.model, 'merchant-reasoner-v1');
+    assert.equal(responsesData.protocol, 'responses');
+    assert.equal(responsesData.text, 'custom responses ok');
+    assert.equal(responsesData.usage.total_tokens, 9);
 
     const image = await fetch(`${origin}/api/images`, {
       method: 'POST',
@@ -83,8 +106,16 @@ test('gateway forwards chat and image requests to separate browser-selected supp
     assert.equal((await image.json()).model, 'merchant-image-v3');
 
     assert.deepEqual(chatReceived.map((item) => [item.url, item.body.model]), [
-      ['/chat-provider/v1/chat/completions', 'merchant-chat-v2']
+      ['/chat-provider/v1/chat/completions', 'merchant-chat-v2'],
+      ['/chat-provider/v1/responses', 'merchant-reasoner-v1']
     ]);
+    assert.deepEqual(chatReceived[0].body.messages, [{ role: 'user', content: 'hello' }]);
+    assert.equal(chatReceived[0].body.input, undefined);
+    assert.equal(chatReceived[0].body.temperature, 0.7);
+    assert.equal(chatReceived[1].body.input, 'reason about this');
+    assert.equal(chatReceived[1].body.instructions, 'be precise');
+    assert.equal(chatReceived[1].body.messages, undefined);
+    assert.equal(chatReceived[1].body.temperature, undefined);
     assert.deepEqual(imageReceived.map((item) => [item.url, item.body.model]), [
       ['/image-provider/v1/images/generations', 'merchant-image-v3']
     ]);
@@ -96,6 +127,14 @@ test('gateway forwards chat and image requests to separate browser-selected supp
     });
     assert.equal(invalid.status, 400);
     assert.equal((await invalid.json()).code, 'MODEL_CONFIG_INVALID');
+
+    const invalidProtocol = await fetch(`${origin}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': 'test-chat-key' },
+      body: JSON.stringify({ prompt: 'hello', baseUrl: chatBaseUrl, model: 'chat', protocol: 'legacy-completions' })
+    });
+    assert.equal(invalidProtocol.status, 400);
+    assert.equal((await invalidProtocol.json()).code, 'MODEL_CONFIG_INVALID');
   } finally {
     gateway.kill('SIGTERM');
     await close(chatUpstream);

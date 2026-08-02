@@ -867,7 +867,7 @@ function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': connection.provider.apiKey },
             signal: controller.signal,
-            body: JSON.stringify({ prompt: upstreamText, system: node.data.prompt, baseUrl: connection.provider.baseUrl, model: connection.model.id })
+            body: JSON.stringify({ prompt: upstreamText, system: node.data.prompt, baseUrl: connection.provider.baseUrl, model: connection.model.id, protocol: connection.model.protocol || 'chat-completions' })
           });
           const data = await response.json();
           if (!response.ok) throw new NodeExecutionError(data.message || '基础模型调用失败', data.code || 'CHAT_REQUEST_FAILED', { requestId: data.requestId, httpStatus: response.status });
@@ -1169,10 +1169,11 @@ function App() {
                   updateSelected({ model: event.target.value, subtitle: `${event.target.value}${suffix}` });
                 }}>
                   {!selectedConnection && <option value="">暂无可用模型</option>}
-                  {selectedConnection?.provider.models.filter((model) => model.capability === selectedCapability).map((model) => <option key={`${model.capability}:${model.id}`} value={model.id}>{model.id}</option>)}
+                  {selectedConnection?.provider.models.filter((model) => model.capability === selectedCapability).map((model) => <option key={`${model.capability}:${model.id}`} value={model.id}>{model.id}{model.capability === 'chat' ? model.protocol === 'responses' ? ' · Responses' : ' · Chat Completions' : ''}</option>)}
                 </select>
               </label>
               <div className="credential-row"><KeyRound size={14} /><span>{selectedConnection?.provider.name || '尚未绑定供应商'}</span><b className={selectedConnection?.provider.apiKey ? 'ok' : ''}>{selectedConnection?.provider.apiKey ? `Key ••••${selectedConnection.provider.apiKey.slice(-4)}` : '未配置'}</b></div>
+              {selectedNode.data.kind === 'llm' && <div className="credential-row"><Webhook size={14} /><span>文本请求接口</span><b className="ok">{selectedConnection?.model.protocol === 'responses' ? '/responses' : '/chat/completions'}</b></div>}
               <button className="variable-button" onClick={() => setWorkspaceView('models')}><Settings size={14} />管理供应商与模型</button>
             </div>}
             {selectedNode.data.kind === 'llm' && <div className="form-section">

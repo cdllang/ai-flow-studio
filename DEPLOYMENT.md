@@ -49,7 +49,7 @@ docker compose logs -f --tail=100
 aiflow.demo.providers
 ```
 
-每条记录包含供应商名称、Base URL、API Key 以及用户添加的文本/图像模型清单。旧键 `aiflow.demo.apiKeys` 会在首次加载时迁移并删除。服务端不创建 Key 配置文件；模型调用时，浏览器将节点选中连接的 Key 通过同源请求发送给网关，网关只在该次请求内使用并转发，不落盘。不同浏览器、设备和域名端口之间不会共享配置；清理浏览器站点数据会删除 Key。
+每条记录包含供应商名称、Base URL、API Key 以及用户添加的文本/图像模型清单。每个文本模型还保存其接口协议：`chat-completions` 对应 `/chat/completions`，`responses` 对应官方小写 `/responses`；旧模型缺少该字段时自动回退到 `chat-completions`。旧键 `aiflow.demo.apiKeys` 会在首次加载时迁移并删除。服务端不创建 Key 配置文件；模型调用时，浏览器将节点选中连接的 Key 通过同源请求发送给网关，网关只在该次请求内使用并转发，不落盘。不同浏览器、设备和域名端口之间不会共享配置；清理浏览器站点数据会删除 Key。
 
 > [!warning]
 > `localStorage` 可被同源 JavaScript 读取，只适合当前受控内测。正式公网生产必须加强 CSP、避免第三方脚本，并优先迁移到服务端 Secret Manager 或加密凭证存储。
