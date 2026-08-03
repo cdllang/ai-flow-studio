@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Background,
   Controls,
@@ -19,11 +20,13 @@ import {
   type XYPosition
 } from '@xyflow/react';
 import {
+  ArrowDownToLine,
   ArrowLeft,
   Bot,
   Braces,
   Check,
   ChevronDown,
+  ChevronsUp,
   CircleStop,
   ClipboardCopy,
   Code2,
@@ -38,8 +41,11 @@ import {
   KeyRound,
   LayoutTemplate,
   LoaderCircle,
+  Maximize2,
   Menu,
   MessageSquareText,
+  Minimize,
+  Minimize2,
   MoreHorizontal,
   PanelBottomClose,
   PanelLeftOpen,
@@ -195,6 +201,8 @@ function detailedRunLog(logs: readonly RunLog[], result: WorkflowOutputBundle) {
 }
 
 type WorkflowSnapshot = { nodes: Node<FlowData>[]; edges: Edge[] };
+
+type DebugWindowMode = 'docked' | 'floating' | 'fullscreen' | 'minimized' | 'closed';
 
 type RuntimeOutput = RuntimeOutputLike & {
   branch?: boolean;
@@ -497,7 +505,14 @@ function App() {
   const [nodes, setNodes] = useState<Node<FlowData>[]>(() => syncNodeProviders(savedWorkflow?.nodes ?? initialNodes, initialProviders));
   const [edges, setEdges] = useState<Edge[]>(savedWorkflow?.edges ?? initialEdges);
   const [selectedId, setSelectedId] = useState<string>('llm-1');
-  const [debugOpen, setDebugOpen] = useState(true);
+  const [debugMode, setDebugMode] = useState<DebugWindowMode>('docked');
+  const [debugPos, setDebugPos] = useState({ x: 120, y: 110 });
+  const [debugDragging, setDebugDragging] = useState(false);
+  const debugDragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null);
+  const debugPrevModeRef = useRef<'docked' | 'floating'>('docked');
+  const [minimapPos, setMinimapPos] = useState<{ x: number; y: number } | null>(null);
+  const [minimapDragging, setMinimapDragging] = useState(false);
+  const minimapDragRef = useRef<{ sx: number; sy: number; originLeft: number; originTop: number; flowW: number; flowH: number; moved: boolean } | null>(null);
   const [libraryOpen, setLibraryOpen] = useState(true);
   const [configPanelOpen, setConfigPanelOpen] = useState(true);
   const [workspaceView, setWorkspaceView] = useState<'editor' | 'models' | 'skills' | 'runs' | 'versions'>(() => initialProviders.some((provider) => provider.apiKey) ? 'editor' : 'models');
@@ -536,6 +551,122 @@ function App() {
     return { title: workflowTitle, input, nodes: snapshot.nodes, edges: snapshot.edges };
   }, [nodes, edges, workflowTitle, input]);
   const assistantWorkflowRevision = useMemo(() => workflowRevision(assistantWorkflow), [assistantWorkflow]);
+
+  const rememberDebugMode = () => {
+    if (debugMode === 'floating') debugPrevModeRef.current = 'floating';
+    else if (debugMode === 'docked') debugPrevModeRef.current = 'docked';
+  };
+
+  const enterDebugFullscreen = () => {
+    if (debugMode === 'fullscreen') return;
+    rememberDebugMode();
+    setDebugMode('fullscreen');
+  };
+
+  const leaveDebugFullscreen = () => setDebugMode(debugPrevModeRef.current);
+
+  const minimizeDebug = () => {
+    if (debugMode === 'minimized') return;
+    rememberDebugMode();
+    setDebugMode('minimized');
+  };
+
+  const restoreDebug = () => setDebugMode(debugPrevModeRef.current);
+
+  const startDebugDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (debugMode === 'fullscreen' || event.button !== 0) return;
+    if ((event.target as HTMLElement).closest('button')) return;
+    event.preventDefault();
+    const base = debugMode === 'docked'
+      ? {
+          x: Math.max(8, Math.min(window.innerWidth - 480, event.clientX - 64)),
+          y: Math.max(8, Math.min(window.innerHeight - 300, event.clientY - 30))
+        }
+      : debugPos;
+    if (debugMode === 'docked') setDebugPos(base);
+    debugDragRef.current = { sx: event.clientX, sy: event.clientY, ox: base.x, oy: base.y };
+    setDebugDragging(true);
+  };
+
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      const drag = debugDragRef.current;
+      if (!drag) return;
+      setDebugPos({
+        x: Math.max(-window.innerWidth + 200, Math.min(window.innerWidth - 120, drag.ox + event.clientX - drag.sx)),
+        y: Math.max(0, Math.min(window.innerHeight - 70, drag.oy + event.clientY - drag.sy))
+      });
+    };
+    const onPointerUp = () => {
+      debugDragRef.current = null;
+      setDebugDragging(false);
+    };
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    return () => {
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (debugMode !== 'fullscreen') return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') leaveDebugFullscreen();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [debugMode]);
+
+  const handleCanvasPointerDown = (event: React.PointerEvent<HTMLElement>) => {
+    if (event.button !== 0) return;
+    const minimap = (event.target as HTMLElement).closest('.react-flow__minimap');
+    if (!minimap) return;
+    const flowRect = event.currentTarget.getBoundingClientRect();
+    const miniRect = minimap.getBoundingClientRect();
+    minimapDragRef.current = {
+      sx: event.clientX,
+      sy: event.clientY,
+      originLeft: miniRect.left - flowRect.left,
+      originTop: miniRect.top - flowRect.top,
+      flowW: flowRect.width,
+      flowH: flowRect.height,
+      moved: false
+    };
+    setMinimapDragging(true);
+  };
+
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      const drag = minimapDragRef.current;
+      if (!drag) return;
+      const dx = event.clientX - drag.sx;
+      const dy = event.clientY - drag.sy;
+      if (!drag.moved && Math.hypot(dx, dy) < 4) return;
+      drag.moved = true;
+      setMinimapPos({
+        x: Math.max(-140, Math.min(drag.flowW - 60, drag.originLeft + dx)),
+        y: Math.max(-90, Math.min(drag.flowH - 60, drag.originTop + dy))
+      });
+    };
+    const onPointerUp = () => {
+      const drag = minimapDragRef.current;
+      minimapDragRef.current = null;
+      setMinimapDragging(false);
+      if (drag?.moved) {
+        window.addEventListener('click', (event) => {
+          event.stopPropagation();
+          event.preventDefault();
+        }, { capture: true, once: true });
+      }
+    };
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    return () => {
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+    };
+  }, []);
 
   useEffect(() => {
     localStorage.setItem(providerStorageKey, JSON.stringify({ schemaVersion: 1, providers }));
@@ -904,7 +1035,7 @@ function App() {
     stopRequestedRef.current = false;
     setRunning(true);
     setResult(emptyOutputBundle());
-    setDebugOpen(true);
+    setDebugMode('docked');
     setWorkspaceView('editor');
     setActiveDebug('process');
     setNodes((items) => items.map((node) => ({ ...node, data: { ...node.data, status: reachableSet.has(node.id) ? 'waiting' : 'idle' } })));
@@ -1178,6 +1309,54 @@ function App() {
     }
   };
 
+  const debugPanelContent = <>
+    <div className={`debug-head ${debugDragging ? 'dragging' : ''}`} onPointerDown={startDebugDrag}>
+      <div className="debug-tabs">
+        <button className={activeDebug === 'process' ? 'active' : ''} onClick={() => setActiveDebug('process')}>运行过程</button>
+        <button className={activeDebug === 'output' ? 'active' : ''} onClick={() => setActiveDebug('output')}>最终输出</button>
+        <button className={activeDebug === 'logs' ? 'active' : ''} onClick={() => setActiveDebug('logs')}>日志</button>
+      </div>
+      <div>
+        <span className={`config-pill ${configuredProviderCount ? 'ready' : ''}`}><span /> {configuredProviderCount ? `${configuredProviderCount} 个供应商已就绪` : '等待模型配置'}</span>
+        <div className="debug-window-controls">
+          {debugMode !== 'fullscreen'
+            ? <button className="icon-button tiny" title="全屏展开调试台" aria-label="全屏展开调试台" onClick={enterDebugFullscreen}><Maximize2 size={15} /></button>
+            : <button className="icon-button tiny" title="还原窗口" aria-label="还原窗口" onClick={leaveDebugFullscreen}><Minimize2 size={15} /></button>}
+          {debugMode !== 'minimized' && <button className="icon-button tiny" title="完全缩小调试台" aria-label="完全缩小调试台" onClick={minimizeDebug}><Minimize size={15} /></button>}
+          {debugMode !== 'docked' && <button className="icon-button tiny" title="停靠回屏幕下方" aria-label="停靠回屏幕下方" onClick={() => setDebugMode('docked')}><ArrowDownToLine size={15} /></button>}
+        </div>
+        <button className="icon-button tiny" title="关闭调试台" aria-label="关闭调试台" onClick={() => setDebugMode('closed')}><PanelBottomClose size={16} /></button>
+      </div>
+    </div>
+    <div className="debug-body">
+      <div className="test-input">
+        <label className="input-caption">测试输入 <span>workflow.input.topic</span></label>
+        <textarea value={input} onChange={(event) => setInput(event.target.value)} />
+        <div
+          className={`image-dropzone ${draggingImage ? 'dragging' : ''} ${referenceImage ? 'has-image' : ''}`}
+          onDragEnter={(event) => { event.preventDefault(); setDraggingImage(true); }}
+          onDragOver={(event) => event.preventDefault()}
+          onDragLeave={(event) => { if (event.currentTarget === event.target) setDraggingImage(false); }}
+          onDrop={(event) => { event.preventDefault(); setDraggingImage(false); setReferenceFile(event.dataTransfer.files[0]); }}
+        >
+          {referenceImage ? <>
+            <img src={referenceImage.dataUrl} alt="参考图片预览" />
+            <div><strong>{referenceImage.name}</strong><small>{(referenceImage.size / 1024 / 1024).toFixed(2)} MB · 将用于扩展生图</small></div>
+            <button type="button" className="remove-reference" aria-label="移除参考图片" onClick={() => setReferenceImage(null)}><Trash2 size={14} /></button>
+          </> : <label htmlFor="reference-image-input"><Upload size={17} /><span><strong>添加参考图片</strong><small>点击或拖入 PNG / JPG / WebP，最大 10 MB</small></span></label>}
+          <input id="reference-image-input" type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => { setReferenceFile(event.target.files?.[0]); event.target.value = ''; }} />
+        </div>
+        {imageInputError && <span className="input-error">{imageInputError}</span>}
+        {running ? <button className="inline-stop" onClick={stopWorkflow}><Square size={13} fill="currentColor" />停止运行</button> : <button onClick={runWorkflow} disabled={!input.trim()}><Play size={15} fill="currentColor" />运行工作流</button>}
+      </div>
+      <div className="run-output">
+        {activeDebug === 'process' && <div className="run-timeline">{runLogs.map((log) => <div className={`timeline-item ${log.status}`} key={log.id}><span className="timeline-status">{log.status === 'success' ? <Check size={13} /> : log.status === 'running' ? <LoaderCircle className="spin" size={13} /> : log.status === 'error' ? <X size={13} /> : <span />}</span><div><strong>{log.title}</strong><small>{log.detail}</small></div><time>{log.elapsed}</time></div>)}</div>}
+        {activeDebug === 'output' && <div className="output-box"><OutputPanel bundle={result} onError={(message) => setResult((previous) => ({ ...previous, error: message }))} /></div>}
+        {activeDebug === 'logs' && <div className={`log-view ${result.error ? 'error' : ''}`}><TerminalSquare size={17} /><pre>{detailedRunLog(runLogs, result)}</pre></div>}
+      </div>
+    </div>
+  </>;
+
   return (
     <div className="app-shell">
       <header className="editor-header">
@@ -1210,7 +1389,7 @@ function App() {
         </div>
       </header>
 
-      <main className={`editor-layout ${workspaceView !== 'editor' ? 'data-mode' : ''} ${debugOpen && workspaceView === 'editor' ? 'debug-open' : ''} ${!libraryOpen ? 'library-closed' : ''} ${!configPanelOpen ? 'config-closed' : ''}`}>
+      <main className={`editor-layout ${workspaceView !== 'editor' ? 'data-mode' : ''} ${debugMode === 'docked' && workspaceView === 'editor' ? 'debug-open' : ''} ${!libraryOpen ? 'library-closed' : ''} ${!configPanelOpen ? 'config-closed' : ''}`}>
         {workspaceView === 'editor' && libraryOpen && <aside className="node-library">
           <div className="panel-heading">
             <div><span>节点库</span><small>{nodes.length} 个节点</small></div>
@@ -1244,7 +1423,11 @@ function App() {
           <button className="library-help" onClick={completeSuggestedWorkflow}><Sparkles size={15} /> 从自然语言生成工作流</button>
         </aside>}
 
-        <section className="canvas-wrap">
+        <section
+          className={`canvas-wrap ${minimapPos ? 'minimap-dragged' : ''} ${minimapDragging ? 'minimap-dragging' : ''}`}
+          onPointerDown={handleCanvasPointerDown}
+          style={minimapPos ? { '--minimap-x': `${minimapPos.x}px`, '--minimap-y': `${minimapPos.y}px` } as React.CSSProperties : undefined}
+        >
           {workspaceView === 'editor' ? <>
           <div className="canvas-breadcrumb"><span>工作流</span><b>/</b><strong>{workflowTitle}</strong></div>
           {draggedLibraryKind && <div className="canvas-drop-hint"><Plus size={14} />松开以添加「{nodeMeta[draggedLibraryKind].label}」</div>}
@@ -1280,7 +1463,7 @@ function App() {
           <div className="canvas-status"><span className="live-dot" /> 自动保存已开启 <b>·</b> 节点可从左侧拖入</div>
           </> : workspaceView === 'models' ? <ProviderManager providers={providers} onSave={saveProvider} onDelete={deleteProvider} /> : workspaceView === 'skills' ? <SkillManager serverSkills={skillCatalog} localSkills={localSkills} catalogStatus={skillCatalogStatus} onSave={saveLocalSkill} onDelete={deleteLocalSkill} /> : workspaceView === 'runs' ? <div className="workspace-data-view">
             <header><div><strong>运行记录</strong><small>最近 {runRecords.length} 次工作流执行</small></div></header>
-            {runRecords.length ? <div className="record-list">{runRecords.map((record) => <article key={record.id}><span className={`record-state ${record.status}`} /> <div><strong>{record.status === 'success' ? '运行成功' : record.status === 'partial' ? '部分成功' : record.status === 'cancelled' ? '用户停止' : '运行失败'}</strong><small>{new Date(record.startedAt).toLocaleString()} · {record.logs.length} 个节点</small></div><code>{record.duration}</code><button onClick={() => { setRunLogs(record.logs); setResult(record.result); setWorkspaceView('editor'); setDebugOpen(true); setActiveDebug(record.status === 'success' || record.status === 'partial' ? 'output' : 'logs'); }}>查看详情</button></article>)}</div> : <div className="data-empty"><TerminalSquare size={24} /><strong>暂无运行记录</strong><span>试运行工作流后会自动保存在这里</span></div>}
+            {runRecords.length ? <div className="record-list">{runRecords.map((record) => <article key={record.id}><span className={`record-state ${record.status}`} /> <div><strong>{record.status === 'success' ? '运行成功' : record.status === 'partial' ? '部分成功' : record.status === 'cancelled' ? '用户停止' : '运行失败'}</strong><small>{new Date(record.startedAt).toLocaleString()} · {record.logs.length} 个节点</small></div><code>{record.duration}</code><button onClick={() => { setRunLogs(record.logs); setResult(record.result); setWorkspaceView('editor'); setDebugMode('docked'); setActiveDebug(record.status === 'success' || record.status === 'partial' ? 'output' : 'logs'); }}>查看详情</button></article>)}</div> : <div className="data-empty"><TerminalSquare size={24} /><strong>暂无运行记录</strong><span>试运行工作流后会自动保存在这里</span></div>}
           </div> : <div className="workspace-data-view">
             <header><div><strong>发布版本</strong><small>可恢复最近 20 个本地版本</small></div><button className="publish-button" onClick={publishWorkflow}><Rocket size={14} />发布当前版本</button></header>
             {versions.length ? <div className="record-list version-list">{versions.map((version) => <article key={`${version.id}-${version.createdAt}`}><span className="version-badge">{version.id}</span><div><strong>{version.nodes.length} 个节点 · {version.edges.length} 条连接</strong><small>{new Date(version.createdAt).toLocaleString()}</small></div><button onClick={() => restoreVersion(version)}>恢复到画布</button></article>)}</div> : <div className="data-empty"><Rocket size={24} /><strong>尚未发布版本</strong><span>点击右上角“发布”保存首个版本</span></div>}
@@ -1442,44 +1625,13 @@ function App() {
           </div> : <div className="empty-panel">选择一个节点查看配置</div>}
         </aside>}
 
-        {workspaceView === 'editor' && <section className="debug-panel">
-          <div className="debug-head">
-            <div className="debug-tabs">
-              <button className={activeDebug === 'process' ? 'active' : ''} onClick={() => setActiveDebug('process')}>运行过程</button>
-              <button className={activeDebug === 'output' ? 'active' : ''} onClick={() => setActiveDebug('output')}>最终输出</button>
-              <button className={activeDebug === 'logs' ? 'active' : ''} onClick={() => setActiveDebug('logs')}>日志</button>
-            </div>
-            <div><span className={`config-pill ${configuredProviderCount ? 'ready' : ''}`}><span /> {configuredProviderCount ? `${configuredProviderCount} 个供应商已就绪` : '等待模型配置'}</span><button className="icon-button tiny" onClick={() => setDebugOpen(false)}><PanelBottomClose size={16} /></button></div>
-          </div>
-          <div className="debug-body">
-            <div className="test-input">
-              <label className="input-caption">测试输入 <span>workflow.input.topic</span></label>
-              <textarea value={input} onChange={(event) => setInput(event.target.value)} />
-              <div
-                className={`image-dropzone ${draggingImage ? 'dragging' : ''} ${referenceImage ? 'has-image' : ''}`}
-                onDragEnter={(event) => { event.preventDefault(); setDraggingImage(true); }}
-                onDragOver={(event) => event.preventDefault()}
-                onDragLeave={(event) => { if (event.currentTarget === event.target) setDraggingImage(false); }}
-                onDrop={(event) => { event.preventDefault(); setDraggingImage(false); setReferenceFile(event.dataTransfer.files[0]); }}
-              >
-                {referenceImage ? <>
-                  <img src={referenceImage.dataUrl} alt="参考图片预览" />
-                  <div><strong>{referenceImage.name}</strong><small>{(referenceImage.size / 1024 / 1024).toFixed(2)} MB · 将用于扩展生图</small></div>
-                  <button type="button" className="remove-reference" aria-label="移除参考图片" onClick={() => setReferenceImage(null)}><Trash2 size={14} /></button>
-                </> : <label htmlFor="reference-image-input"><Upload size={17} /><span><strong>添加参考图片</strong><small>点击或拖入 PNG / JPG / WebP，最大 10 MB</small></span></label>}
-                <input id="reference-image-input" type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => { setReferenceFile(event.target.files?.[0]); event.target.value = ''; }} />
-              </div>
-              {imageInputError && <span className="input-error">{imageInputError}</span>}
-              {running ? <button className="inline-stop" onClick={stopWorkflow}><Square size={13} fill="currentColor" />停止运行</button> : <button onClick={runWorkflow} disabled={!input.trim()}><Play size={15} fill="currentColor" />运行工作流</button>}
-            </div>
-            <div className="run-output">
-              {activeDebug === 'process' && <div className="run-timeline">{runLogs.map((log) => <div className={`timeline-item ${log.status}`} key={log.id}><span className="timeline-status">{log.status === 'success' ? <Check size={13} /> : log.status === 'running' ? <LoaderCircle className="spin" size={13} /> : log.status === 'error' ? <X size={13} /> : <span />}</span><div><strong>{log.title}</strong><small>{log.detail}</small></div><time>{log.elapsed}</time></div>)}</div>}
-              {activeDebug === 'output' && <div className="output-box"><OutputPanel bundle={result} onError={(message) => setResult((previous) => ({ ...previous, error: message }))} /></div>}
-              {activeDebug === 'logs' && <div className={`log-view ${result.error ? 'error' : ''}`}><TerminalSquare size={17} /><pre>{detailedRunLog(runLogs, result)}</pre></div>}
-            </div>
-          </div>
-        </section>}
-        {workspaceView === 'editor' && !debugOpen && <button className="open-debug" onClick={() => setDebugOpen(true)}><TerminalSquare size={15} /> 打开调试台</button>}
+        {(debugMode === 'docked' || debugMode === 'floating' || debugMode === 'fullscreen') && (debugMode === 'docked'
+          ? <section className="debug-panel">{debugPanelContent}</section>
+          : createPortal(<section className={`debug-window ${debugMode}`} style={debugMode === 'floating' ? { left: debugPos.x, top: debugPos.y } : undefined} role="dialog" aria-modal="true" aria-label="调试台">{debugPanelContent}</section>, document.body))}
+        {workspaceView === 'editor' && (debugMode === 'closed' || debugMode === 'minimized') && <button className="open-debug" onClick={() => setDebugMode('docked')}><TerminalSquare size={15} /> 打开调试台</button>}
+        {debugMode === 'minimized' && <button className="debug-minimized-pill" onClick={restoreDebug} title="还原调试台"><TerminalSquare size={15} /><span>调试台</span><ChevronsUp size={14} /></button>}
+        {workspaceView === 'editor' && (debugMode === 'closed' || debugMode === 'minimized') && <button className="open-debug" onClick={() => setDebugMode('docked')}><TerminalSquare size={15} /> 打开调试台</button>}
+        {debugMode === 'minimized' && <button className="debug-minimized-pill" onClick={restoreDebug} title="还原调试台"><TerminalSquare size={15} /><span>调试台</span><ChevronsUp size={14} /></button>}
       </main>
 
       <WorkflowAssistant

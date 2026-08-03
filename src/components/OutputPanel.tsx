@@ -22,6 +22,26 @@ type OutputPanelProps = {
   onError?: (message: string) => void;
 };
 
+async function writeClipboard(value: string) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = value;
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  textarea.style.pointerEvents = 'none';
+  document.body.appendChild(textarea);
+  try {
+    textarea.focus();
+    textarea.select();
+    if (!document.execCommand('copy')) throw new Error('execCommand copy failed');
+  } finally {
+    textarea.remove();
+  }
+}
+
 function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
@@ -69,7 +89,7 @@ export function OutputPanel({ bundle, onError }: OutputPanelProps) {
 
   const copy = async (id: string, value: string) => {
     try {
-      await navigator.clipboard.writeText(value);
+      await writeClipboard(value);
       setCopiedId(id);
       window.setTimeout(() => setCopiedId(''), 1600);
     } catch {
