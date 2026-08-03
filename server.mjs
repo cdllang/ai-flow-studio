@@ -8,6 +8,7 @@ import { loadWorkflowAssistantSkill } from './system-skill-loader.mjs';
 import {
   addSessionTurn,
   applySessionCompression,
+  bindWorkflowDraftModels,
   compileWorkflowDraft,
   extractJsonObject,
   inputOutputConfirmationQuestion,
@@ -168,6 +169,7 @@ app.get('/api/skills', (_req, res) => {
 
 app.post('/api/workflow-assistant/turn', async (req, res) => {
   const id = requestId();
+  res.set('X-AIFlow-Request-ID', id);
   const chatApiKey = requestApiKey(req);
   if (!chatApiKey) return res.status(503).json({ code: 'CHAT_KEY_MISSING', message: '请先为 AI 工作流助手选择已配置 API Key 的文本模型', requestId: id });
 
@@ -233,6 +235,71 @@ app.post('/api/workflow-assistant/turn', async (req, res) => {
   };
   const stages = [];
   let compression = { attempted: false, compressed: false, estimatedTokens: 0, threshold: 0 };
+  const streamsProgress = /application\/x-ndjson/i.test(req.get('accept') || '');
+  if (streamsProgress) {
+    res.status(200);
+    res.set({
+      'Cache-Control': 'no-store, no-transform',
+      'Content-Type': 'application/x-ndjson; charset=utf-8',
+      'X-Accel-Buffering': 'no'
+    });
+    res.flushHeaders();
+  }
+  const streamEvent = (event) => {
+    if (streamsProgress && !res.destroyed && !res.writableEnded) res.write(`${JSON.stringify(event)}\n`);
+  };
+  const heartbeatTimer = streamsProgress ? setInterval(() => streamEvent({ type: 'heartbeat', at: Date.now() }), 15_000) : null;
+  heartbeatTimer?.unref();
+  res.once('close', () => { if (heartbeatTimer) clearInterval(heartbeatTimer); });
+  const publishStage = (index) => {
+    if (stages[index]) streamEvent({ type: 'stage', index, stage: stages[index] });
+  };
+  const finishTurn = (status, payload) => {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (!streamsProgress) return res.status(status).set('Cache-Control', 'no-store').json(payload);
+    streamEvent({ type: 'result', status, body: payload });
+    if (!res.writableEnded) res.end();
+    return res;
+  };
+  const callStructuredModel = async (options, schemaName) => {
+    const response = await callTextModel(options);
+    try {
+      return extractJsonObject(response.text);
+    } catch (firstError) {
+      const formatStageIndex = stages.push({ stage: 'format_repair', status: 'running', detail: `${schemaName} 包含额外或无效内容，正在进行一次无损 JSON 格式修复` }) - 1;
+      publishStage(formatStageIndex);
+      try {
+        const reformatted = await callTextModel({
+          ...options,
+          system: 'You are a Strict JSON Reformatter. Return exactly one valid JSON object and no markdown or commentary. Preserve the first complete object and its semantics. Remove duplicated or trailing objects. Repair syntax only when required. Never invent new fields or values.',
+          prompt: JSON.stringify({ schemaName, invalidOutput: response.text.slice(0, 200_000) }),
+          temperature: 0
+        });
+        const parsed = extractJsonObject(reformatted.text);
+        stages[formatStageIndex] = { stage: 'format_repair', status: 'success', detail: `${schemaName} 已恢复为单一 JSON 对象，将继续执行全部结构校验` };
+        publishStage(formatStageIndex);
+        return parsed;
+      } catch (repairError) {
+        stages[formatStageIndex] = { stage: 'format_repair', status: 'error', detail: `${schemaName} 格式修复失败：${safeError(repairError)}` };
+        publishStage(formatStageIndex);
+        throw new Error(`${safeError(firstError)}；自动格式修复失败：${safeError(repairError)}`);
+      }
+    }
+  };
+  const bindCandidateModels = (draft) => {
+    const bindings = [];
+    const bound = bindWorkflowDraftModels(draft, {
+      providers: providerCatalog,
+      builderProviderId: builder.id,
+      builderModelId: builder.model,
+      onBind: (binding) => bindings.push(binding)
+    });
+    if (bindings.length) {
+      const bindingStageIndex = stages.push({ stage: 'model_binding', status: 'success', detail: `已将 ${bindings.length} 个无效模型引用绑定到用户配置中真实存在的兼容模型` }) - 1;
+      publishStage(bindingStageIndex);
+    }
+    return bound;
+  };
 
   const contextForBuilder = () => ({
     session: {
@@ -261,45 +328,49 @@ app.post('/api/workflow-assistant/turn', async (req, res) => {
     if (!sourceTurns.length) {
       session.phase = 'blocked';
       session = addSessionTurn(session, 'assistant', '当前工作流和契约已超过模型上下文预算，且没有可安全压缩的旧消息。请缩小当前工作流或新建 Session。', 'blocked');
-      return res.status(413).json({ code: 'ASSISTANT_CONTEXT_TOO_LARGE', message: '上下文超过安全预算且无法压缩', session, compression, stages, requestId: id });
+      return finishTurn(413, { code: 'ASSISTANT_CONTEXT_TOO_LARGE', message: '上下文超过安全预算且无法压缩', session, compression, stages, requestId: id });
     }
     const sourceTurnIds = sourceTurns.map((turn) => turn.id);
     let compressionError = null;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
-      stages.push({ stage: 'compression', status: 'running', detail: `正在压缩较早上下文 · 第 ${attempt} 次` });
+      const compressionStageIndex = stages.push({ stage: 'compression', status: 'running', detail: `正在压缩较早上下文 · 第 ${attempt} 次` }) - 1;
+      publishStage(compressionStageIndex);
       try {
-        const response = await callTextModel({
+        const summary = await callStructuredModel({
           ...builder,
           system: `${workflowAssistantSkill.memory}\n\nReturn one JSON object with confirmedDecisions, rejectedAlternatives, assumptions, pendingQuestions, appliedRevisions, terminology, and sourceTurnIds. Preserve every supplied source turn id.`,
           prompt: JSON.stringify({ priorSummary: session.summary, sourceTurns, contract: session.contract, currentWorkflowRevision: session.currentWorkflowRevision })
-        });
-        const summary = extractJsonObject(response.text);
+        }, 'SessionSummary');
         if (!Array.isArray(summary.sourceTurnIds) || sourceTurnIds.some((turnId) => !summary.sourceTurnIds.includes(turnId))) throw new Error('压缩摘要未覆盖所有来源消息');
         session = applySessionCompression(session, summary, sourceTurnIds);
         compression = { ...compression, compressed: true, sourceTurns: sourceTurnIds.length, retainedTurns: session.recentTurns.length };
-        stages[stages.length - 1] = { stage: 'compression', status: 'success', detail: `已压缩 ${sourceTurnIds.length} 条旧消息，保留最近 ${session.recentTurns.length} 条` };
+        stages[compressionStageIndex] = { stage: 'compression', status: 'success', detail: `已压缩 ${sourceTurnIds.length} 条旧消息，保留最近 ${session.recentTurns.length} 条` };
+        publishStage(compressionStageIndex);
         compressionError = null;
         break;
       } catch (error) {
         compressionError = error;
-        stages[stages.length - 1] = { stage: 'compression', status: 'error', detail: safeError(error) };
+        stages[compressionStageIndex] = { stage: 'compression', status: 'error', detail: safeError(error) };
+        publishStage(compressionStageIndex);
       }
     }
     if (compressionError) {
       session.phase = 'blocked';
       session = addSessionTurn(session, 'assistant', '上下文压缩连续两次未通过完整性检查。为避免丢失已确认边界，本 Session 已暂停。', 'blocked');
-      return res.status(422).json({ code: 'SESSION_COMPRESSION_FAILED', message: safeError(compressionError), session, compression, stages, requestId: id });
+      return finishTurn(422, { code: 'SESSION_COMPRESSION_FAILED', message: safeError(compressionError), session, compression, stages, requestId: id });
     }
   }
 
   const applyAuthoritativeConstraints = (contract) => ({ ...normalizeTaskContract(contract), constraints: { ...normalizeTaskContract(contract).constraints, ...authoritativeConstraints } });
   const builderSystem = `${workflowAssistantSkill.builder}\n\n${workflowAssistantSkill.contracts}\n\nYou are the Builder entrypoint. Return exactly one JSON AssistantTurn object and no markdown. WorkflowPlan is the sole source of truth: define every step, responsibility, input/output, and justified connection there first. The application will ignore model-authored positions and compile canvas edges exclusively from WorkflowPlan.connections. Use only the supplied node, provider, and model catalogs. Every draft node status must be idle. Treat a supplied confirmation object as the user's authoritative answer to that exact question. The only user-facing clarification allowed is confirmation of the inferred inputs and outputs. Infer scope, exclusions, acceptance criteria, permissions, budgets, and implementation details using safe defaults; never ask the user to confirm them. The application itself will render the one input/output confirmation question.`;
   let envelope;
+  let intentStageIndex = -1;
   try {
     session.phase = 'drafting';
-    stages.push({ stage: 'intent', status: 'running', detail: '系统 Skill 正在识别并核对任务输入与输出' });
-    const builderResponse = await callTextModel({ ...builder, system: builderSystem, prompt: JSON.stringify(contextForBuilder()) });
-    envelope = normalizeAssistantEnvelope(extractJsonObject(builderResponse.text));
+    intentStageIndex = stages.push({ stage: 'intent', status: 'running', detail: '系统 Skill 正在识别并核对任务输入与输出' }) - 1;
+    publishStage(intentStageIndex);
+    const builderJson = await callStructuredModel({ ...builder, system: builderSystem, prompt: JSON.stringify(contextForBuilder()) }, 'AssistantTurn');
+    envelope = normalizeAssistantEnvelope(builderJson);
     envelope.contract = applyAuthoritativeConstraints(envelope.contract);
     if (!envelope.contract.objective) envelope.contract.objective = message.slice(0, 1_000);
     const nextInputOutputSignature = inputOutputSignature(envelope.contract);
@@ -320,47 +391,67 @@ app.post('/api/workflow-assistant/turn', async (req, res) => {
     } else {
       envelope.contract.unresolvedQuestions = [];
     }
-    stages[stages.length - 1] = { stage: 'intent', status: 'success', detail: envelope.status === 'needs_clarification' ? '等待用户确认输入与输出' : '输入与输出已经确认' };
+    stages[intentStageIndex] = { stage: 'intent', status: 'success', detail: envelope.status === 'needs_clarification' ? '等待用户确认输入与输出' : '输入与输出已经确认' };
+    publishStage(intentStageIndex);
   } catch (error) {
     const status = error instanceof TextModelError ? error.status : 502;
     session.phase = 'blocked';
-    if (stages.at(-1)?.status === 'running') stages[stages.length - 1] = { ...stages.at(-1), status: 'error', detail: safeError(error) };
-    return res.status(status).json({ code: error.code || 'ASSISTANT_BUILDER_INVALID', message: safeError(error), requestId: id, upstreamRequestId: error.upstreamRequestId || '', session, stages });
+    if (intentStageIndex >= 0 && stages[intentStageIndex]?.status === 'running') {
+      stages[intentStageIndex] = { ...stages[intentStageIndex], status: 'error', detail: safeError(error) };
+      publishStage(intentStageIndex);
+    }
+    return finishTurn(status, { code: error.code || 'ASSISTANT_BUILDER_INVALID', message: safeError(error), requestId: id, upstreamRequestId: error.upstreamRequestId || '', session, stages });
   }
 
   session.contract = envelope.contract;
   if (envelope.status !== 'draft_ready') {
     session.phase = envelope.status === 'blocked' ? 'blocked' : 'discovery';
     session = addSessionTurn(session, 'assistant', [envelope.message, ...envelope.questions].join('\n'), envelope.status);
-    return res.set('Cache-Control', 'no-store').json({ schemaVersion: 1, response: envelope, session, stages, compression, systemSkill: { id: workflowAssistantSkill.id, version: workflowAssistantSkill.version, autoApplied: true }, requestId: id });
+    return finishTurn(200, { schemaVersion: 1, response: envelope, session, stages, compression, systemSkill: { id: workflowAssistantSkill.id, version: workflowAssistantSkill.version, autoApplied: true }, requestId: id });
   }
 
-  let candidateDraft = compileWorkflowDraft(envelope.draft);
+  let candidateDraft = bindCandidateModels(compileWorkflowDraft(envelope.draft));
   let report = validationReport({ valid: false, issues: [] }, [], 0);
   let repairAttempt = 0;
   while (repairAttempt <= maxAssistantRepairAttempts) {
     session.phase = 'validating';
-    stages.push({ stage: 'deterministic_validation', status: 'running', detail: '正在按流程图编译并检查 Schema、连线、权限、模型引用、Secret 与预算' });
+    const deterministicStageIndex = stages.push({ stage: 'deterministic_validation', status: 'running', detail: '正在按流程图编译并检查 Schema、连线、权限、模型引用、Secret 与预算' }) - 1;
+    publishStage(deterministicStageIndex);
     const deterministic = validateWorkflowDraft(candidateDraft, { providers: providerCatalog, constraints: authoritativeConstraints });
-    stages[stages.length - 1] = { stage: 'deterministic_validation', status: deterministic.valid ? 'success' : 'error', detail: deterministic.valid ? '确定性检查全部通过' : `发现 ${deterministic.issues.length} 个结构问题` };
+    stages[deterministicStageIndex] = { stage: 'deterministic_validation', status: deterministic.valid ? 'success' : 'error', detail: deterministic.valid ? '确定性检查全部通过' : `发现 ${deterministic.issues.length} 个结构问题` };
+    publishStage(deterministicStageIndex);
 
     let criticIssues = [];
     if (deterministic.valid) {
-      stages.push({ stage: 'critic', status: 'running', detail: critic.id && critic.id !== builder.id ? '正在使用独立审查模型检查需求覆盖' : '正在使用隔离上下文 Critic 检查需求覆盖' });
+      const criticStageIndex = stages.push({ stage: 'critic', status: 'running', detail: critic.id && critic.id !== builder.id ? '正在使用独立审查模型检查需求覆盖' : '正在使用隔离上下文 Critic 检查需求覆盖' }) - 1;
+      publishStage(criticStageIndex);
       try {
-        const criticResponse = await callTextModel({
+        const { edges: compiledEdges = [], ...canonicalDraft } = candidateDraft;
+        const criticResult = await callStructuredModel({
           ...critic,
           system: `${workflowAssistantSkill.critic}\n\n${workflowAssistantSkill.contracts}`,
-          prompt: JSON.stringify({ contract: envelope.contract, candidateDraft, currentWorkflow, deterministicFacts: deterministic, providers: providerCatalog })
-        });
-        const criticResult = extractJsonObject(criticResponse.text);
+          prompt: JSON.stringify({
+            contract: envelope.contract,
+            candidateDraft: canonicalDraft,
+            compiledGraph: {
+              source: 'application-compiler',
+              nodeIds: candidateDraft.nodes.map((node) => node.id),
+              edges: compiledEdges.map(({ id, source, target, sourceHandle }) => ({ id, source, target, ...(sourceHandle ? { sourceHandle } : {}) }))
+            },
+            currentWorkflow,
+            deterministicFacts: deterministic,
+            providers: providerCatalog
+          })
+        }, 'CriticResult');
         criticIssues = Array.isArray(criticResult.issues) ? criticResult.issues : [];
         if (criticResult.passed !== true && !criticIssues.some((entry) => entry?.severity === 'error')) criticIssues.push({ severity: 'error', code: 'CRITIC_REJECTED_WITHOUT_DETAILS', message: 'Critic 拒绝草案但未提供有效证据' });
         const criticPassed = criticResult.passed === true && !criticIssues.some((entry) => entry?.severity === 'error');
-        stages[stages.length - 1] = { stage: 'critic', status: criticPassed ? 'success' : 'error', detail: criticPassed ? '语义覆盖检查通过' : `Critic 发现 ${criticIssues.length} 个问题` };
+        stages[criticStageIndex] = { stage: 'critic', status: criticPassed ? 'success' : 'error', detail: criticPassed ? '语义覆盖检查通过' : `Critic 发现 ${criticIssues.length} 个问题` };
+        publishStage(criticStageIndex);
       } catch (error) {
         criticIssues = [{ severity: 'error', code: error.code || 'CRITIC_RESPONSE_INVALID', message: safeError(error), evidence: error.upstreamRequestId || '' }];
-        stages[stages.length - 1] = { stage: 'critic', status: 'error', detail: safeError(error) };
+        stages[criticStageIndex] = { stage: 'critic', status: 'error', detail: safeError(error) };
+        publishStage(criticStageIndex);
       }
     }
     report = validationReport(deterministic, criticIssues, repairAttempt);
@@ -369,20 +460,23 @@ app.post('/api/workflow-assistant/turn', async (req, res) => {
 
     repairAttempt += 1;
     session.phase = 'repairing';
-    stages.push({ stage: 'repair', status: 'running', detail: `正在进行第 ${repairAttempt}/${maxAssistantRepairAttempts} 轮受限修复` });
+    const repairStageIndex = stages.push({ stage: 'repair', status: 'running', detail: `正在进行第 ${repairAttempt}/${maxAssistantRepairAttempts} 轮受限修复` }) - 1;
+    publishStage(repairStageIndex);
     try {
-      const repairResponse = await callTextModel({
+      const repairedJson = await callStructuredModel({
         ...builder,
         system: `${workflowAssistantSkill.builder}\n\n${workflowAssistantSkill.contracts}\n\nYou are the Repair entrypoint. Return one complete draft_ready AssistantTurn JSON object. WorkflowPlan remains the sole source of truth; repair the plan first and keep node configs aligned with its step ids and kinds. Do not add direct or transitive connections when an existing path already carries the same dependency. Preserve the contract and change only allow-listed workflow draft fields. Never change permissions, provider credentials, schema version, validation state, or repair counters.`,
         prompt: JSON.stringify({ contract: envelope.contract, candidateDraft, validation: report, currentWorkflow, providers: providerCatalog, permissions: authoritativeConstraints })
-      });
-      const repaired = normalizeAssistantEnvelope(extractJsonObject(repairResponse.text));
+      }, 'AssistantTurn');
+      const repaired = normalizeAssistantEnvelope(repairedJson);
       if (repaired.status !== 'draft_ready' || !repaired.draft) throw new Error('修复模型未返回完整草案');
-      candidateDraft = compileWorkflowDraft(repaired.draft);
+      candidateDraft = bindCandidateModels(compileWorkflowDraft(repaired.draft));
       envelope.message = repaired.message;
-      stages[stages.length - 1] = { stage: 'repair', status: 'success', detail: `第 ${repairAttempt} 轮修复已生成，重新执行全部检查` };
+      stages[repairStageIndex] = { stage: 'repair', status: 'success', detail: `第 ${repairAttempt} 轮修复已生成，重新执行全部检查` };
+      publishStage(repairStageIndex);
     } catch (error) {
-      stages[stages.length - 1] = { stage: 'repair', status: 'error', detail: safeError(error) };
+      stages[repairStageIndex] = { stage: 'repair', status: 'error', detail: safeError(error) };
+      publishStage(repairStageIndex);
       report = { ...report, valid: false, issues: [...report.issues, { source: 'critic', severity: 'error', code: error.code || 'REPAIR_RESPONSE_INVALID', message: safeError(error) }] };
       break;
     }
@@ -400,7 +494,7 @@ app.post('/api/workflow-assistant/turn', async (req, res) => {
     envelope = { ...envelope, status: 'blocked', message: `草案在 ${repairAttempt} 轮修复后仍未通过严格校验，未修改当前画布。`, draft: candidateDraft, validation: report };
     session = addSessionTurn(session, 'assistant', envelope.message, 'blocked');
   }
-  return res.set('Cache-Control', 'no-store').json({ schemaVersion: 1, response: envelope, session, stages, compression, systemSkill: { id: workflowAssistantSkill.id, version: workflowAssistantSkill.version, autoApplied: true }, requestId: id });
+  return finishTurn(200, { schemaVersion: 1, response: envelope, session, stages, compression, systemSkill: { id: workflowAssistantSkill.id, version: workflowAssistantSkill.version, autoApplied: true }, requestId: id });
 });
 
 app.post('/api/chat', async (req, res) => {

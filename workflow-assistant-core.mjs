@@ -223,11 +223,44 @@ export function extractJsonObject(value) {
   if (typeof value !== 'string' || !value.trim()) throw new Error('Model returned an empty response');
   const trimmed = value.trim();
   const unfenced = trimmed.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-  const start = unfenced.indexOf('{');
-  const end = unfenced.lastIndexOf('}');
-  if (start < 0 || end <= start) throw new Error('Model response does not contain a JSON object');
-  const json = unfenced.slice(start, end + 1);
-  try { return JSON.parse(json); } catch (error) { throw new Error(`Model returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`); }
+  const objects = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < unfenced.length; index += 1) {
+    const character = unfenced[index];
+    if (start < 0) {
+      if (character === '{') {
+        start = index;
+        depth = 1;
+        inString = false;
+        escaped = false;
+      }
+      continue;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') inString = true;
+    else if (character === '{') depth += 1;
+    else if (character === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        const json = unfenced.slice(start, index + 1);
+        try { objects.push(JSON.parse(json)); } catch (error) { throw new Error(`Model returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`); }
+        start = -1;
+      }
+    }
+  }
+  if (start >= 0) throw new Error('Model returned invalid JSON: object is not closed');
+  if (!objects.length) throw new Error('Model response does not contain a JSON object');
+  const first = JSON.stringify(objects[0]);
+  if (objects.some((object) => JSON.stringify(object) !== first)) throw new Error('Model returned multiple conflicting JSON objects');
+  return objects[0];
 }
 
 export function normalizeAssistantEnvelope(value) {
@@ -307,6 +340,31 @@ export function compileWorkflowDraft(draft) {
     layerNodeIds.forEach((nodeId, index) => positions.set(nodeId, { x: 80 + layer * 310, y: 220 - totalHeight / 2 + index * 180 }));
   }
   return { ...clone(draft), plan: clone(plan), nodes: nodes.map((node) => ({ ...node, position: positions.get(node.id) || { x: 80, y: 220 } })), edges };
+}
+
+export function bindWorkflowDraftModels(draft, options = {}) {
+  const normalized = clone(draft);
+  if (!normalized || typeof normalized !== 'object' || !Array.isArray(normalized.nodes)) return normalized;
+  const providers = Array.isArray(options.providers) ? options.providers : [];
+  const modelsFor = (capability) => providers.flatMap((provider) => Array.isArray(provider?.models)
+    ? provider.models.filter((model) => model?.capability === capability && text(model?.id, 200)).map((model) => ({ providerId: provider.id, modelId: model.id }))
+    : []);
+  const validPair = (providerId, modelId, capability) => modelsFor(capability).some((candidate) => candidate.providerId === providerId && candidate.modelId === modelId);
+  const builderCandidate = validPair(options.builderProviderId, options.builderModelId, 'chat')
+    ? { providerId: options.builderProviderId, modelId: options.builderModelId }
+    : null;
+
+  normalized.nodes = normalized.nodes.map((node) => {
+    const kind = node?.data?.kind;
+    if (!['llm', 'image'].includes(kind)) return node;
+    const capability = kind === 'llm' ? 'chat' : 'image';
+    if (validPair(node.data.providerId, node.data.model, capability)) return node;
+    const fallback = capability === 'chat' ? builderCandidate || modelsFor('chat')[0] : modelsFor('image')[0];
+    if (!fallback) return node;
+    options.onBind?.({ nodeId: node.id, kind, fromProviderId: node.data.providerId || '', fromModelId: node.data.model || '', toProviderId: fallback.providerId, toModelId: fallback.modelId });
+    return { ...node, data: { ...node.data, providerId: fallback.providerId, model: fallback.modelId } };
+  });
+  return normalized;
 }
 
 const issue = (source, code, message, options = {}) => ({ source, severity: options.severity || 'error', code, message, ...(options.nodeId ? { nodeId: options.nodeId } : {}), ...(options.path ? { path: options.path } : {}), ...(options.evidence ? { evidence: options.evidence } : {}), ...(options.suggestedFix ? { suggestedFix: options.suggestedFix } : {}) });

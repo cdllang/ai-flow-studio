@@ -98,8 +98,7 @@ await page.route('**/api/workflow-assistant/turn', async (route) => {
   const baseSession = request.session;
   const userTurn = { id: `turn-user-${turnIndex}`, role: 'user', content: request.message, createdAt: now };
   if (turnIndex === 1) {
-    const session = { ...baseSession, phase: 'drafting', recentTurns: [...baseSession.recentTurns, userTurn], currentWorkflowRevision: request.currentWorkflowRevision, updatedAt: now };
-    return route.fulfill({ status: 504, contentType: 'application/json', body: JSON.stringify({ code: 'ASSISTANT_MODEL_TIMEOUT', message: '上游模型响应超时，已自动重试 1 次；请稍后重试或切换模型', session, stages: [{ stage: 'intent', status: 'running', detail: '系统 Skill 正在确认目标、边界与验收标准' }], requestId: 'req-timeout-1' }) });
+    return route.fulfill({ status: 504, contentType: 'application/json', headers: { 'x-request-id': 'proxy-empty-1' }, body: '' });
   }
   if (turnIndex === 2) {
     const question = '请确认输入与输出：输入为「商品说明（文本，必填）」；输出为「商品文案（文本）」。是否符合你的要求？';
@@ -142,10 +141,12 @@ try {
   const composer = page.getByRole('textbox', { name: 'AI 工作流需求' });
   await composer.fill('请调整当前工作流');
   await page.getByRole('button', { name: '发送', exact: true }).click();
-  await page.getByRole('alert').getByText(/上游模型响应超时，已自动重试 1 次/).waitFor();
+  await page.getByRole('alert').getByText(/AI 工作流服务返回空响应/).waitFor();
   const timeoutStopsSpinner = await page.locator('.assistant-stages .spin').count() === 0
     && await page.getByRole('button', { name: '重新尝试' }).isVisible()
-    && await page.getByRole('button', { name: '切换模型' }).isVisible();
+    && await page.getByRole('button', { name: '切换模型' }).isVisible()
+    && await page.getByRole('alert').getByText('ASSISTANT_EMPTY_RESPONSE').isVisible()
+    && await page.getByRole('alert').getByText(/proxy-empty-1/).isVisible();
   await page.screenshot({ path: path.join(screenshotDir, 'workflow-assistant-timeout-state.png'), fullPage: true });
   await page.getByRole('button', { name: '重新尝试' }).click();
   await page.getByText(/请确认输入与输出：输入为/).last().waitFor();
@@ -162,7 +163,7 @@ try {
   await page.getByText(/保留稳定结构的商品文案/).last().waitFor();
   await page.getByRole('button', { name: '是', exact: true }).click();
   await page.getByText('草案已通过严格校验').waitFor();
-  const strictStagesVisible = await page.getByText('确定性校验', { exact: true }).isVisible() && await page.getByText('独立 Critic', { exact: true }).isVisible();
+  const strictStagesVisible = await page.getByText('校验流程结构', { exact: true }).isVisible() && await page.getByText('审查任务覆盖', { exact: true }).isVisible();
   const planPreviewVisible = await page.getByRole('region', { name: 'AI 流程方案预览' }).isVisible()
     && await page.getByLabel('工作流流程图').isVisible()
     && await page.getByText('流程图是节点与连线的唯一来源').isVisible()

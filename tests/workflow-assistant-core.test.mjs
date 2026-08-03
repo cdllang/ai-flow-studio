@@ -5,6 +5,7 @@ import { loadWorkflowAssistantSkill } from '../system-skill-loader.mjs';
 import {
   addSessionTurn,
   applySessionCompression,
+  bindWorkflowDraftModels,
   compileWorkflowDraft,
   createAssistantSession,
   extractJsonObject,
@@ -95,6 +96,33 @@ test('assistant envelope accepts clarification or draft and rejects ambiguous mo
   const draft = normalizeAssistantEnvelope(extractJsonObject(`\`\`\`json\n${JSON.stringify({ status: 'draft_ready', message: 'ready', contract, questions: [], draft: validDraft() })}\n\`\`\``));
   assert.equal(draft.draft.schema, 'aiflow.workflow-draft');
   assert.throws(() => normalizeAssistantEnvelope({ status: 'needs_clarification', message: 'missing questions', contract, questions: [] }), /questions/);
+});
+
+test('JSON extraction tolerates prose and identical duplicates but rejects conflicting objects', () => {
+  const payload = { status: 'ok', nested: { text: 'brace } inside a string' }, escaped: '"quoted"' };
+  assert.deepEqual(extractJsonObject(`Result:\n${JSON.stringify(payload)}\nDone.`), payload);
+  assert.deepEqual(extractJsonObject(`${JSON.stringify(payload)}\n${JSON.stringify(payload)}`), payload);
+  assert.throws(
+    () => extractJsonObject(`${JSON.stringify(payload)}\n${JSON.stringify({ ...payload, status: 'blocked' })}`),
+    /multiple conflicting JSON objects/
+  );
+});
+
+test('deterministic model binding repairs invalid references without changing valid selections', () => {
+  const invalid = validDraft();
+  invalid.nodes.find((node) => node.id === 'llm-1').data = { ...invalid.nodes.find((node) => node.id === 'llm-1').data, providerId: 'invented-provider', model: 'invented-chat-model' };
+  invalid.nodes.find((node) => node.id === 'image-1').data = { ...invalid.nodes.find((node) => node.id === 'image-1').data, providerId: 'invented-provider', model: 'invented-image-model' };
+
+  const bound = bindWorkflowDraftModels(invalid, { providers, builderProviderId: 'provider-main', builderModelId: 'text-model' });
+
+  assert.deepEqual(
+    bound.nodes.filter((node) => ['llm', 'image'].includes(node.data.kind)).map((node) => [node.data.kind, node.data.providerId, node.data.model]),
+    [['llm', 'provider-main', 'text-model'], ['image', 'provider-main', 'image-model']]
+  );
+  assert.equal(validateWorkflowDraft(bound, { providers, constraints: contract.constraints }).issues.some((issue) => ['PROVIDER_NOT_FOUND', 'MODEL_NOT_FOUND'].includes(issue.code)), false);
+
+  const alreadyValid = validDraft();
+  assert.deepEqual(bindWorkflowDraftModels(alreadyValid, { providers, builderProviderId: 'provider-main', builderModelId: 'text-model' }), alreadyValid);
 });
 
 test('session compression triggers after 12 turns and preserves the latest six turns verbatim', () => {

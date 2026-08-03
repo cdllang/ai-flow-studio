@@ -32,7 +32,7 @@ const contract = {
   unresolvedQuestions: []
 };
 
-const draft = (providerId = 'provider-main') => ({
+const draft = (providerId = 'provider-main', prompt = '根据商品说明生成文案') => ({
   schema: 'aiflow.workflow-draft',
   schemaVersion: 1,
   title: '商品文案生成器',
@@ -52,7 +52,7 @@ const draft = (providerId = 'provider-main') => ({
   },
   nodes: [
     { id: 'start-1', type: 'flowNode', position: { x: 80, y: 160 }, data: { kind: 'start', title: '开始', subtitle: '商品说明', status: 'idle' } },
-    { id: 'llm-1', type: 'flowNode', position: { x: 360, y: 160 }, data: { kind: 'llm', title: '生成文案', subtitle: 'text-model', status: 'idle', providerId, model: 'text-model', prompt: '根据商品说明生成文案' } },
+    { id: 'llm-1', type: 'flowNode', position: { x: 360, y: 160 }, data: { kind: 'llm', title: '生成文案', subtitle: 'text-model', status: 'idle', providerId, model: 'text-model', prompt } },
     { id: 'output-1', type: 'flowNode', position: { x: 640, y: 160 }, data: { kind: 'output', title: '输出', subtitle: '商品文案', status: 'idle' } }
   ],
   edges: []
@@ -60,13 +60,16 @@ const draft = (providerId = 'provider-main') => ({
 
 test('workflow assistant auto-applies the system Skill, repairs invalid drafts, isolates Critic, and compresses sessions', async () => {
   const calls = [];
+  let formatFailureInjected = false;
   const upstream = http.createServer(async (request, response) => {
     const body = await readJson(request);
     const system = body.messages?.[0]?.content || body.instructions || '';
     const prompt = body.messages?.at(-1)?.content || body.input || '{}';
     calls.push({ authorization: request.headers.authorization, system, prompt, body });
     let content;
-    if (system.includes('Session Memory and Compression')) {
+    if (system.includes('Strict JSON Reformatter')) {
+      content = JSON.stringify({ status: 'needs_clarification', message: '格式已修复', contract, questions: ['请确认输入与输出'] });
+    } else if (system.includes('Session Memory and Compression')) {
       const payload = JSON.parse(prompt);
       content = JSON.stringify({
         confirmedDecisions: ['保持本地 Session'],
@@ -82,14 +85,18 @@ test('workflow assistant auto-applies the system Skill, repairs invalid drafts, 
     } else if (system.includes('Repair entrypoint')) {
       content = JSON.stringify({ status: 'draft_ready', message: '修复完成', contract, questions: [], draft: draft() });
     } else if ((() => { try { return JSON.parse(prompt).latestMessage?.includes('clarify'); } catch { return false; } })()) {
-      content = JSON.stringify({
+      const validClarification = JSON.stringify({
         status: 'needs_clarification',
         message: '需要确认输出渠道',
         contract: { ...contract, acceptanceCriteria: [], unresolvedQuestions: ['输出渠道是什么？'] },
         questions: ['输出渠道是什么？']
       });
+      if (!formatFailureInjected) {
+        formatFailureInjected = true;
+        content = `${validClarification}\n${JSON.stringify({ status: 'blocked', message: '冲突对象', contract, questions: [] })}`;
+      } else content = validClarification;
     } else {
-      content = JSON.stringify({ status: 'draft_ready', message: '草案已生成', contract, questions: [], draft: draft('missing-provider') });
+      content = JSON.stringify({ status: 'draft_ready', message: '草案已生成', contract, questions: [], draft: draft('missing-provider', '') });
     }
     response.setHeader('Content-Type', 'application/json');
     response.end(JSON.stringify({ choices: [{ message: { content } }], model: body.model, usage: { total_tokens: 100 } }));
@@ -115,9 +122,9 @@ test('workflow assistant auto-applies the system Skill, repairs invalid drafts, 
     }
     assert.ok(Date.now() < deadline, `gateway failed to start:\n${gatewayOutput}`);
     const baseUrl = `http://127.0.0.1:${upstreamPort}/v1`;
-    const request = (message, session, confirmation = null) => fetch(`${origin}/api/workflow-assistant/turn`, {
+    const request = (message, session, confirmation = null, stream = false) => fetch(`${origin}/api/workflow-assistant/turn`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': 'builder-test-key' },
+      headers: { 'Content-Type': 'application/json', 'X-AIFlow-API-Key': 'builder-test-key', ...(stream ? { Accept: 'application/x-ndjson' } : {}) },
       body: JSON.stringify({
         message,
         session,
@@ -138,6 +145,18 @@ test('workflow assistant auto-applies the system Skill, repairs invalid drafts, 
     assert.doesNotMatch(clarification.response.questions[0], /输出渠道/);
     assert.deepEqual(clarification.systemSkill, { id: 'guard-workflow-intent', version: '1.0.0', autoApplied: true });
     assert.equal(clarification.session.phase, 'discovery');
+    assert.equal(clarification.stages.some((stage) => stage.stage === 'format_repair' && stage.status === 'success'), true);
+
+    const streamedResponse = await request('stream clarify request', null, null, true);
+    assert.equal(streamedResponse.status, 200);
+    assert.match(streamedResponse.headers.get('content-type') || '', /application\/x-ndjson/);
+    const streamedEvents = (await streamedResponse.text()).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    assert.equal(streamedEvents.some((event) => event.type === 'stage' && event.stage?.stage === 'intent' && event.stage?.status === 'running'), true);
+    assert.equal(streamedEvents.some((event) => event.type === 'stage' && event.stage?.stage === 'intent' && event.stage?.status === 'success'), true);
+    const streamedResult = streamedEvents.at(-1);
+    assert.equal(streamedResult.type, 'result');
+    assert.equal(streamedResult.status, 200);
+    assert.equal(streamedResult.body.response.status, 'needs_clarification');
 
     const draftResponse = await request('输入与输出符合要求', clarification.session, { answer: 'yes', question: clarification.response.questions[0] });
     assert.equal(draftResponse.status, 200);
@@ -149,6 +168,7 @@ test('workflow assistant auto-applies the system Skill, repairs invalid drafts, 
     assert.ok(generated.session.confirmedInputOutputSignature);
     assert.deepEqual(generated.response.draft.edges.map(({ source, target }) => [source, target]), [['start-1', 'llm-1'], ['llm-1', 'output-1']]);
     assert.equal(generated.stages.some((stage) => stage.stage === 'repair' && stage.status === 'success'), true);
+    assert.equal(generated.stages.some((stage) => stage.stage === 'model_binding' && stage.status === 'success'), true);
     assert.equal(generated.stages.some((stage) => stage.stage === 'critic' && stage.status === 'success'), true);
 
     let longSession = createAssistantSession({ providerId: 'provider-main', modelId: 'text-model' });
@@ -165,6 +185,10 @@ test('workflow assistant auto-applies the system Skill, repairs invalid drafts, 
     assert.equal(calls.some((call) => call.system.includes('Independent Workflow Critic') && !call.system.includes('Builder entrypoint')), true);
     assert.equal(calls.some((call) => call.system.includes('Session Memory and Compression')), true);
     assert.equal(calls.some((call) => call.prompt.includes('builder-test-key')), false);
+    const criticCall = calls.find((call) => call.system.includes('Independent Workflow Critic'));
+    const criticPayload = JSON.parse(criticCall.prompt);
+    assert.equal(Object.hasOwn(criticPayload.candidateDraft, 'edges'), false);
+    assert.deepEqual(criticPayload.compiledGraph.edges.map(({ source, target }) => [source, target]), [['start-1', 'llm-1'], ['llm-1', 'output-1']]);
 
     const publicSkills = await fetch(`${origin}/api/skills`).then((response) => response.json());
     assert.deepEqual(publicSkills.skills.map((skill) => skill.id), ['gpt-image-2']);

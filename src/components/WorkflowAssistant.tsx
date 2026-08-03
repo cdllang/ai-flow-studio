@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, ArrowRight, Bot, Check, ChevronDown, CircleStop, GitBranch, ListTree, LoaderCircle, Plus, RotateCcw, Send, ShieldCheck, Sparkles, X } from 'lucide-react';
 import { assistantProviderCatalog, createWorkflowAssistantSession, type AssistantStage, type WorkflowAssistantDraft, type WorkflowAssistantResponse, type WorkflowAssistantSession, type WorkflowPlan } from '../assistantSession';
+import { AssistantTransportError, readAssistantTurnResponse } from '../assistantTransport';
 import { providersForCapability, type ModelProvider } from '../providerConfig';
 
 type WorkflowAssistantProps = {
@@ -20,10 +21,11 @@ const phaseLabel: Record<WorkflowAssistantSession['phase'], string> = {
 };
 
 const stageLabel: Record<string, string> = {
-  compression: '压缩上下文', intent: '识别输入与输出', deterministic_validation: '确定性校验', critic: '独立 Critic', repair: '受限修复'
+  compression: '压缩上下文', intent: '解析输入与输出', format_repair: '修复模型输出格式', model_binding: '绑定可用模型', deterministic_validation: '校验流程结构', critic: '审查任务覆盖', repair: '自动修复方案', result: '准备本轮结果'
 };
 type ConfirmationPayload = { answer: 'yes' | 'no' | 'other'; question: string; detail?: string };
 type RetryAttempt = { message: string; confirmation?: ConfirmationPayload };
+const formatElapsed = (seconds: number) => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 
 const planKindLabel: Record<WorkflowPlan['steps'][number]['kind'], string> = {
   start: '开始', llm: '大模型', image: '图像生成', condition: '条件', http: 'HTTP', code: '代码', aggregate: '聚合', output: '输出'
@@ -130,8 +132,10 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
   const [errorCode, setErrorCode] = useState('');
+  const [errorRequestId, setErrorRequestId] = useState('');
   const [retryAttempt, setRetryAttempt] = useState<RetryAttempt | null>(null);
   const [stages, setStages] = useState<AssistantStage[]>([]);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [compressionNotice, setCompressionNotice] = useState('');
   const [customAnswerOpen, setCustomAnswerOpen] = useState(false);
   const [customAnswer, setCustomAnswer] = useState('');
@@ -142,6 +146,7 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
   const critic = criticKey === 'same' ? null : connections.find((entry) => entry.key === criticKey) || null;
   const draftStale = Boolean(session.candidateDraft && session.phase !== 'applied' && session.currentWorkflowRevision && session.currentWorkflowRevision !== currentWorkflowRevision);
   const pendingQuestion = session.phase === 'discovery' ? session.contract.unresolvedQuestions[0] || '' : '';
+  const activeStage = [...stages].reverse().find((stage) => stage.status === 'running');
 
   useEffect(() => {
     if (!builderKey && initialConnection) setBuilderKey(initialConnection.key);
@@ -150,7 +155,15 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
   useEffect(() => {
     if (!open || !messagesRef.current) return;
     messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
-  }, [open, session.recentTurns, sending]);
+  }, [open, session.recentTurns, sending, stages]);
+
+  useEffect(() => {
+    if (!sending) return;
+    const startedAt = Date.now();
+    setElapsedSeconds(0);
+    const timer = window.setInterval(() => setElapsedSeconds(Math.floor((Date.now() - startedAt) / 1_000)), 1_000);
+    return () => window.clearInterval(timer);
+  }, [sending]);
 
   if (!open) return null;
 
@@ -161,7 +174,8 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
     setSending(true);
     setError('');
     setErrorCode('');
-    setStages([{ stage: 'intent', status: 'running', detail: '正在调用系统级意图守卫' }]);
+    setErrorRequestId('');
+    setStages([{ stage: 'intent', status: 'running', detail: '正在连接 Builder 并调用系统级意图守卫' }]);
     setCompressionNotice('');
     const controller = new AbortController();
     abortRef.current = controller;
@@ -171,6 +185,7 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
         signal: controller.signal,
         headers: {
           'Content-Type': 'application/json',
+          Accept: 'application/x-ndjson',
           'X-AIFlow-API-Key': builder.provider.apiKey,
           ...(critic ? { 'X-AIFlow-Critic-Key': critic.provider.apiKey } : {})
         },
@@ -187,19 +202,40 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
           retry
         })
       });
-      const data = await response.json() as WorkflowAssistantResponse & { code?: string; message?: string };
+      const parsed = await readAssistantTurnResponse<WorkflowAssistantResponse & { code?: string; message?: string; requestId?: string }>(response, ({ index, stage }) => {
+        setStages((items) => {
+          const next = [...items];
+          next[index] = stage;
+          return next.filter(Boolean);
+        });
+      });
+      const data = parsed.data;
       if (data.session) onSessionChange(data.session);
-      if (Array.isArray(data.stages)) setStages(data.stages);
       if (data.compression?.compressed) setCompressionNotice(`已自动压缩 ${data.compression.sourceTurns || 0} 条较早消息，保留最近 ${data.compression.retainedTurns || 0} 条原文`);
-      if (!response.ok) {
-        setErrorCode(data.code || `HTTP_${response.status}`);
-        throw new Error(data.message || data.code || `AI 工作流助手返回 ${response.status}`);
+      const completedStages = Array.isArray(data.stages) ? data.stages : [];
+      if (parsed.status < 200 || parsed.status >= 300) {
+        setStages([...completedStages, { stage: 'result', status: 'error', detail: '本轮构建未产生可应用结果，当前画布保持不变' }]);
+        setErrorCode(data.code || `HTTP_${parsed.status}`);
+        setErrorRequestId(data.requestId || '');
+        throw new Error(data.message || data.code || `AI 工作流助手返回 ${parsed.status}`);
       }
+      const resultDetail = data.session?.phase === 'discovery'
+        ? '输入与输出已识别，等待你的确认'
+        : data.session?.phase === 'awaiting_confirmation'
+          ? '方案已通过全部校验，可以预览并应用'
+          : data.session?.phase === 'blocked'
+            ? '严格校验未通过，当前画布保持不变'
+            : '本轮处理已完成';
+      setStages([...completedStages, { stage: 'result', status: data.session?.phase === 'blocked' ? 'error' : 'success', detail: resultDetail }]);
       setMessage('');
       setCustomAnswer('');
       setCustomAnswerOpen(false);
       setRetryAttempt(null);
     } catch (reason) {
+      if (reason instanceof AssistantTransportError) {
+        setErrorCode(reason.code);
+        setErrorRequestId(reason.requestId);
+      }
       const failureMessage = reason instanceof DOMException && reason.name === 'AbortError'
         ? '本次生成已停止，Session 上下文仍已保留'
         : reason instanceof Error ? reason.message : 'AI 工作流助手调用失败';
@@ -222,6 +258,7 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
     setCustomAnswerOpen(false);
     setError('');
     setErrorCode('');
+    setErrorRequestId('');
     setRetryAttempt(null);
   };
 
@@ -255,7 +292,7 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
     <div className="assistant-scroll" ref={messagesRef}>
       {!session.recentTurns.length && <div className="assistant-welcome"><Sparkles size={22} /><strong>描述你希望创建或调整的工作流</strong><p>我会识别任务并只请你确认输入与输出，其他实现边界按安全默认值自动处理。</p><div><button onClick={() => setMessage('根据当前工作流，为三个渠道分别生成商品图片和对应文案。')}>创建多渠道内容流</button><button onClick={() => setMessage('检查当前工作流并减少不必要的模型调用，同时保留全部输出。')}>优化当前工作流</button></div></div>}
       {session.recentTurns.map((turn) => <article className={`assistant-message ${turn.role}`} key={turn.id}><span>{turn.role === 'user' ? '你' : <Bot size={13} />}</span><div><p>{turn.content}</p><time>{new Date(turn.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div></article>)}
-      {sending && <article className="assistant-message assistant loading"><span><LoaderCircle className="spin" size={13} /></span><div><p>正在执行系统 Skill 与校验链…</p></div></article>}
+      {sending && <article className="assistant-message assistant loading"><span><LoaderCircle className="spin" size={13} /></span><div><p>{activeStage ? `${stageLabel[activeStage.stage] || activeStage.stage}：${activeStage.detail}` : '正在建立 AI 构建连接…'}</p><time>已用时 {formatElapsed(elapsedSeconds)} · 阶段结果实时返回</time></div></article>}
 
       {(session.contract.objective || session.contract.unresolvedQuestions.length > 0) && <section className="assistant-contract">
         <header><strong>任务摘要</strong><span>{session.contract.unresolvedQuestions.length ? '待确认输入输出' : '输入输出已确认'}</span></header>
@@ -281,7 +318,7 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
       </section>}
 
       {compressionNotice && <div className="assistant-compression"><RotateCcw size={13} />{compressionNotice}</div>}
-      {stages.length > 0 && <section className="assistant-stages"><header><strong>校验链</strong><small>服务端不可绕过</small></header>{stages.map((stage, index) => <div key={`${stage.stage}-${index}`} className={stage.status}><span>{stage.status === 'running' ? <LoaderCircle className="spin" size={12} /> : stage.status === 'success' ? <Check size={12} /> : <X size={12} />}</span><div><strong>{stageLabel[stage.stage] || stage.stage}</strong><small>{stage.detail}</small></div></div>)}</section>}
+      {stages.length > 0 && <section className="assistant-stages" aria-live="polite"><header><strong>构建进度</strong><small>{sending ? `实时执行 · ${formatElapsed(elapsedSeconds)}` : `完成 ${stages.filter((stage) => stage.status === 'success').length}/${stages.length} 个阶段`}</small></header>{stages.map((stage, index) => <div key={`${stage.stage}-${index}`} className={`${stage.status}${stage.status === 'running' ? ' current' : ''}`} aria-current={stage.status === 'running' ? 'step' : undefined}><span data-step={index + 1}>{stage.status === 'running' ? <LoaderCircle className="spin" size={12} /> : stage.status === 'success' ? <Check size={12} /> : <X size={12} />}</span><div><strong>{stageLabel[stage.stage] || stage.stage}</strong><small>{stage.detail}</small></div></div>)}</section>}
 
       {!sending && session.validation && (!session.validation.valid || session.phase === 'awaiting_confirmation' || session.phase === 'applied') && <section className={`assistant-validation ${session.validation.valid ? 'valid' : 'invalid'}`}>
         <header>{session.validation.valid ? <Check size={14} /> : <AlertTriangle size={14} />}<strong>{session.validation.valid ? '草案已通过严格校验' : '草案已阻断'}</strong><span>{session.validation.repairAttempt} 次修复</span></header>
@@ -291,7 +328,7 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
       {sending && session.candidateDraft?.plan && <section className="assistant-plan-refreshing" role="status"><span><LoaderCircle className="spin" size={16} /></span><div><strong>正在生成新版流程方案</strong><small>上一版已锁定，等待本轮校验链完成</small></div></section>}
       {!sending && session.candidateDraft?.plan && <WorkflowPlanPreview draft={session.candidateDraft} applied={session.phase === 'applied'} disabled={session.phase !== 'awaiting_confirmation' || !session.validation?.valid || draftStale} onApply={applyDraft} onRevise={() => { setMessage('请调整当前流程方案：'); requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('.assistant-composer textarea')?.focus()); }} />}
       {draftStale && <div className="assistant-error"><AlertTriangle size={14} />画布已更新，此草案不能覆盖最新修改。请继续对话以重新生成。</div>}
-      {error && <div className="assistant-error" role="alert"><div className="assistant-error-copy"><AlertTriangle size={14} /><span>{errorCode && <code>{errorCode}</code>}{error}</span></div><div className="assistant-error-actions">{retryAttempt && <button onClick={() => void send(retryAttempt.message, retryAttempt.confirmation, true)}>重新尝试</button>}<button onClick={() => builderSelectRef.current?.focus()}>切换模型</button></div></div>}
+      {error && <div className="assistant-error" role="alert"><div className="assistant-error-copy"><AlertTriangle size={14} /><span>{errorCode && <code>{errorCode}</code>}{error}{errorRequestId && <small>请求 ID：{errorRequestId}</small>}</span></div><div className="assistant-error-actions">{retryAttempt && <button onClick={() => void send(retryAttempt.message, retryAttempt.confirmation, true)}>重新尝试</button>}<button onClick={() => builderSelectRef.current?.focus()}>切换模型</button></div></div>}
     </div>
 
     <footer className="assistant-composer">

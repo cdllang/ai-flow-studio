@@ -193,11 +193,15 @@ button svg { flex: 0 0 auto; }
 .assistant-custom-answer button { padding: 0 9px; color: #08110c; background: var(--green); border: 0; border-radius: 5px; font-size: 8px; font-weight: 900; }
 .assistant-compression { min-height: 34px; margin-top: 10px; padding: 0 9px; gap: 7px; color: #cbd8ff; background: rgba(86,136,255,.055); border: 1px solid rgba(86,136,255,.2); border-radius: 6px; font-size: 8px; }
 .assistant-stages > header small { color: var(--muted); font-size: 8px; }
-.assistant-stages > div { display: grid; grid-template-columns: 22px minmax(0,1fr); min-height: 42px; align-items: center; gap: 7px; border-bottom: 1px solid var(--line); }
+.assistant-stages > div { position: relative; display: grid; grid-template-columns: 22px minmax(0,1fr); min-height: 42px; align-items: center; padding: 0 4px; gap: 7px; border-bottom: 1px solid var(--line); transition: background .16s ease, border-color .16s ease; }
 .assistant-stages > div:last-child { border-bottom: 0; }
 .assistant-stages > div > span { display: grid; width: 20px; height: 20px; place-items: center; color: var(--muted); background: var(--panel-2); border-radius: 5px; }
 .assistant-stages > div.success > span { color: var(--green); }
 .assistant-stages > div.error > span { color: var(--red); }
+.assistant-stages > div.current { margin: 3px 0; background: rgba(86,136,255,.065); border-color: rgba(86,136,255,.22); border-radius: 5px; }
+.assistant-stages > div.current > span { color: #cbd8ff; background: rgba(86,136,255,.12); box-shadow: 0 0 0 1px rgba(86,136,255,.22), 0 0 0 5px rgba(86,136,255,.035); animation: assistant-stage-pulse 1.8s ease-in-out infinite; }
+.assistant-stages > div.current strong { color: #dce6ff; }
+@keyframes assistant-stage-pulse { 50% { box-shadow: 0 0 0 1px rgba(86,136,255,.34), 0 0 0 8px rgba(86,136,255,0); } }
 .assistant-stages strong, .assistant-stages small { display: block; }
 .assistant-stages strong { font-size: 9px; }
 .assistant-stages small { margin-top: 3px; color: var(--muted); font-size: 8px; line-height: 1.4; }
@@ -282,6 +286,7 @@ button svg { flex: 0 0 auto; }
 .assistant-error-copy > svg { flex: 0 0 auto; }
 .assistant-error-copy span { min-width: 0; }
 .assistant-error-copy code { display: block; margin-bottom: 2px; color: #ff8585; font-size: 7px; }
+.assistant-error-copy small { display: block; margin-top: 4px; color: #c78484; font: 7px/1.4 "Cascadia Code", Consolas, monospace; overflow-wrap: anywhere; }
 .assistant-error-actions { justify-content: flex-end; gap: 6px; }
 .assistant-error-actions button { min-height: 26px; padding: 0 9px; color: #ffd2d2; background: rgba(240,100,100,.08); border: 1px solid rgba(240,100,100,.28); border-radius: 5px; font-size: 8px; font-weight: 800; }
 .assistant-error-actions button:hover { color: #fff; border-color: rgba(240,100,100,.55); }
@@ -291,6 +296,7 @@ button svg { flex: 0 0 auto; }
 .assistant-composer textarea::placeholder { color: #676e78; }
 .assistant-composer > div { display: flex; align-items: center; justify-content: space-between; margin-top: 7px; }
 .assistant-composer small { color: #6c737d; font-size: 7px; }
+@media (prefers-reduced-motion: reduce) { .assistant-stages > div.current > span { animation: none; } }
 .assistant-send, .assistant-stop { display: inline-flex; min-height: 32px; align-items: center; padding: 0 10px; gap: 5px; border-radius: 5px; font-size: 9px; font-weight: 900; }
 .assistant-send { color: #12151b; background: #fff; }
 .assistant-stop { color: #ffaaaa; background: rgba(240,100,100,.1); border: 1px solid rgba(240,100,100,.3); }

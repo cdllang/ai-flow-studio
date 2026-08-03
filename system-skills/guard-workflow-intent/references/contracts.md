@@ -115,4 +115,4 @@ Any `error` makes the report invalid. Warnings remain visible in the confirmatio
 
 ## Allowed repair surface
 
-Permit repairs only to workflow title, node positions, node non-secret configuration, prompts, output bindings, and edges. Reject patches that alter schema version, provider credentials, session security policy, approval state, validation results, or repair counters.
+Permit repairs only to workflow title, `WorkflowPlan` steps/connections, node positions, node non-secret configuration, prompts, and output bindings. Canvas edges are never model-authored; the application recompiles them from `WorkflowPlan.connections` after every repair. Reject patches that alter schema version, provider credentials, session security policy, approval state, validation results, or repair counters.

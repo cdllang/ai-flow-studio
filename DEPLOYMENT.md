@@ -72,6 +72,33 @@ docker image prune -f
 http://127.0.0.1:14590
 ```
 
+AI 辅助构建可能包含多次长推理调用。`/api/workflow-assistant/turn` 使用 NDJSON 阶段流并每 15 秒发送心跳；Nginx 必须关闭响应缓冲，并把读取超时设为高于服务端允许的最长模型调用时间：
+
+```nginx
+location /api/workflow-assistant/ {
+    proxy_pass http://127.0.0.1:14590;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+    proxy_buffering off;
+    proxy_cache off;
+    gzip off;
+    proxy_read_timeout 900s;
+    proxy_send_timeout 900s;
+}
+
+location / {
+    proxy_pass http://127.0.0.1:14590;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+如果前面还有 CDN、云负载均衡或面板代理，也要关闭该路径的响应缓冲并把空闲超时设为至少 900 秒。否则代理可能返回空 502/504；新版前端会显示 `ASSISTANT_EMPTY_RESPONSE` 和请求 ID，而不会再显示浏览器原生 JSON 解析错误。
+
 ## 自定义配置
 
 可在 `compose.yaml` 的 `environment` 中调整以下非敏感配置：

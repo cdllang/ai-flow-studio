@@ -114,7 +114,9 @@ Session 不只保存聊天文本，还要独立持久化 TaskContract、当前�
 | 408/网络超时 | 最多一次指数退避重试，保留自然语言需求 |
 | 429 | 读取 `Retry-After`，允许用户切换连接或稍后重试 |
 | 5xx | 最多两次有限重试，显示供应商请求 ID |
-| 非法 JSON | 尝试一次严格提取；失败进入修复，不直接解析自由文本 |
+| 空响应/HTML 错误页 | 前端先读文本再解析，转换为 `ASSISTANT_EMPTY_RESPONSE` / `ASSISTANT_INVALID_RESPONSE`，显示 HTTP 状态与请求 ID，不暴露浏览器原生 JSON 异常 |
+| 阶段流中断 | 返回 `ASSISTANT_STREAM_INTERRUPTED` 或 `ASSISTANT_STREAM_INCOMPLETE`，停止动画并保持当前画布不变 |
+| 非法或重复 JSON | 按字符串边界提取完整对象；相同重复对象去重，冲突对象触发一次无损 JSON 格式修复，随后仍需通过完整 Schema 与图校验 |
 | Schema/图校验失败 | 返回字段路径与节点 ID，进入最多两轮修复 |
 | Critic 拒绝 | 保留草案与问题列表，不写入画布 |
 | 用户停止 | 中止当前请求，保留需求和最近一次合法草案 |
@@ -125,7 +127,10 @@ Session 不只保存聊天文本，还要独立持久化 TaskContract、当前�
 POST /api/workflow-assistant/turn
 X-AIFlow-API-Key: <用户选中连接的 Key>
 Content-Type: application/json
+Accept: application/x-ndjson
 ```
+
+长任务使用 NDJSON 返回 `stage / heartbeat / result` 事件。服务端在 Builder、确定性校验、Critic、格式修复与 Repair 开始/结束时发送真实阶段事件，并每 15 秒发送一次无业务含义的心跳；同时设置 `X-Accel-Buffering: no`，避免反向代理因长时间没有响应字节而截断连接。未声明 NDJSON 的旧客户端仍收到普通 JSON。
 
 ```json
 {
@@ -168,6 +173,12 @@ Content-Type: application/json
 - 二次调整开始时隐藏上一版有效校验与应用操作，显示锁定状态；仅当最新响应进入 `awaiting_confirmation` 且本轮验证有效时恢复“确认并应用”。
 - 模型网络错误或单次超时自动重试一次；连续超时返回 `ASSISTANT_MODEL_TIMEOUT` 与中文 504 提示，不回显底层 Abort 异常。
 - 助手单次模型调用默认等待 300 秒，可配置为 30–900 秒；超时后服务端把 Session 置为 `blocked`，前端停止阶段动画并提供“重新尝试 / 切换模型”。
+- 前端不再直接调用 `response.json()`：空响应、非 JSON、读取失败、阶段流中断和缺少最终结果均转换为带错误码、HTTP 状态和请求 ID 的中文诊断。
+- AI 构建过程实时展示“解析输入输出、修复模型输出格式、绑定可用模型、校验流程结构、审查任务覆盖、自动修复方案、准备结果”，包含进行中/成功/失败状态与累计耗时。
+- 模型输出按完整 JSON 对象边界解析；重复相同对象确定性去重，冲突对象最多执行一次严格格式修复，不接受未经 Schema、Plan 和图校验的自由文本。
+- 无效文本模型引用确定性绑定到用户当前选择且目录中存在的 Builder 模型；图像节点只绑定真实声明的图像模型，无兼容模型时仍然阻断。
+- Critic 接收不含 `edges` 的规范草案与独立只读 `compiledGraph`；应用派生连线与 Plan 一致时不得误判为模型越权。
+- 2026-08-04 使用 OpenAI 兼容供应商和 `gpt-5.6-luna` 完成真实两轮验收：输入输出确认后生成 4 节点/3 连线草案，确定性校验与 Critic 均通过，0 个问题、0 次 Repair；测试密钥未写入文件、日志或镜像。
 
 ## 后续实施顺序
 
@@ -187,3 +198,4 @@ Content-Type: application/json
 - 同一输入可回放，完整记录模型、供应商、提示模板版本、检查结果和 correlationId。
 - 任意 Session 恢复或压缩后，TaskContract、授权边界、验收标准、未决问题和当前 revision 必须保持一致。
 - Builder 无法绕过确定性验证器或伪造 Critic 通过状态；只有服务端编排器能写入验证结果。
+- 自动化基线为 48 项测试全通过；浏览器回归覆盖空响应、错误码与请求 ID、阶段动画停止、输入输出确认、最新草案锁定、应用门禁和刷新恢复，非预期 console/page error 为 0。
