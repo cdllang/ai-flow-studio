@@ -13,6 +13,7 @@
     "verify:config": "node scripts/verify-config.mjs",
     "verify:features": "node scripts/verify-features.mjs",
     "verify:interactions": "node scripts/verify-interactions.mjs",
+    "verify:workspace-chrome": "node scripts/verify-workspace-chrome.mjs",
     "verify:ratios": "node scripts/verify-ratios.mjs",
     "verify:preview": "node scripts/verify-image-preview.mjs",
     "verify:multi-output": "node scripts/verify-multi-output.mjs",

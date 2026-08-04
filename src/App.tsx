@@ -1625,13 +1625,11 @@ function App() {
           </div> : <div className="empty-panel">选择一个节点查看配置</div>}
         </aside>}
 
-        {(debugMode === 'docked' || debugMode === 'floating' || debugMode === 'fullscreen') && (debugMode === 'docked'
+        {workspaceView === 'editor' && (debugMode === 'docked' || debugMode === 'floating' || debugMode === 'fullscreen') && (debugMode === 'docked'
           ? <section className="debug-panel">{debugPanelContent}</section>
           : createPortal(<section className={`debug-window ${debugMode}`} style={debugMode === 'floating' ? { left: debugPos.x, top: debugPos.y } : undefined} role="dialog" aria-modal="true" aria-label="调试台">{debugPanelContent}</section>, document.body))}
         {workspaceView === 'editor' && (debugMode === 'closed' || debugMode === 'minimized') && <button className="open-debug" onClick={() => setDebugMode('docked')}><TerminalSquare size={15} /> 打开调试台</button>}
-        {debugMode === 'minimized' && <button className="debug-minimized-pill" onClick={restoreDebug} title="还原调试台"><TerminalSquare size={15} /><span>调试台</span><ChevronsUp size={14} /></button>}
-        {workspaceView === 'editor' && (debugMode === 'closed' || debugMode === 'minimized') && <button className="open-debug" onClick={() => setDebugMode('docked')}><TerminalSquare size={15} /> 打开调试台</button>}
-        {debugMode === 'minimized' && <button className="debug-minimized-pill" onClick={restoreDebug} title="还原调试台"><TerminalSquare size={15} /><span>调试台</span><ChevronsUp size={14} /></button>}
+        {workspaceView === 'editor' && debugMode === 'minimized' && <button className="debug-minimized-pill" onClick={restoreDebug} title="还原调试台"><TerminalSquare size={15} /><span>调试台</span><ChevronsUp size={14} /></button>}
       </main>
 
       <WorkflowAssistant
