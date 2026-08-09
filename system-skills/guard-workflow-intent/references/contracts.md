@@ -86,7 +86,9 @@ type WorkflowDraft = {
 
 `plan` is the only graph definition. The application derives the flowchart, explanation, layout, canvas nodes, and every canvas edge from it. The `nodes` array supplies runtime configuration for exactly the step IDs in `plan.steps`; positions are ignored. Do not return `edges` because the application compiles them exclusively from `plan.connections`.
 
-Use stable lowercase IDs. Every step requires a purpose plus explicit input/output descriptions. Every connection requires a reason and data type. Do not add a direct connection when the same dependency already travels through an existing path. Ordinary processing nodes have one primary upstream; use an aggregate node for fan-in. Allow only node kinds present in the runtime catalog. Never embed provider credentials. Provider and model references must point to catalog entries included by the application.
+Use stable lowercase IDs. Every step requires a purpose plus explicit input/output descriptions. Every connection requires a reason and data type. Do not add a direct connection when the same specific dependency already travels unchanged through an existing path. Topological reachability alone is not redundancy: keep the direct connection when the target `inputMapping` or output binding reads `sourceId.field`, or when the alternate path carries a transformed or different value. Ordinary processing nodes have one primary upstream; use an aggregate node for fan-in. Allow only node kinds present in the runtime catalog. Never embed provider credentials. Provider and model references must point to catalog entries included by the application.
+
+Condition node configuration is closed and case-sensitive. A condition node must use `conditionSource: 'input' | 'upstream'`, `conditionOperator: 'contains' | 'not_contains' | 'equals' | 'not_equals'`, and a non-empty string `conditionValue`. Never invent aliases such as `includes`, `match`, `in`, `keyword`, or `regex`; they are not runtime operators. Its two outgoing plan connections must use `sourceHandle: 'true'` and `sourceHandle: 'false'` respectively.
 
 ## Validation report
 

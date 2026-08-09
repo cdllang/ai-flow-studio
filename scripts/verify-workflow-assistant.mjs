@@ -132,25 +132,60 @@ try {
   if (Date.now() >= deadline) throw new Error(`gateway failed to start:\n${gatewayOutput}`);
 
   await page.goto(origin, { waitUntil: 'networkidle' });
+  const assistantAbsentOutsideOrchestrationAtStartup = await page.getByRole('button', { name: 'AI 构建', exact: true }).count() === 0
+    && await page.getByRole('dialog', { name: 'AI 工作流构建 Session' }).count() === 0;
+  await page.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
+  await page.locator('.flow-node').first().waitFor();
   const originalNodeCount = await page.locator('.flow-node').count();
   await page.getByRole('button', { name: 'AI 构建', exact: true }).click();
   const panelVisible = await page.getByRole('dialog', { name: 'AI 工作流构建 Session' }).isVisible();
+  const reportButtonVisible = await page.getByRole('button', { name: '报错并导出 Session 日志' }).isVisible();
+  await page.locator('.assistant-settings > summary').click();
   const systemSkillLocked = await page.getByText('guard-workflow-intent').isVisible() && await page.getByText('系统级自动调用 · 用户不可关闭').isVisible();
   const criticDefaultsIsolated = await page.getByRole('combobox', { name: 'AI Critic 模型' }).inputValue() === 'same';
+
+  const nonEditorViews = ['模型服务', 'Skills', '运行记录', '版本', '工作流库'];
+  const assistantScopeChecks = [];
+  for (const viewName of nonEditorViews) {
+    await page.locator('.header-center').getByRole('button', { name: viewName, exact: true }).click();
+    await page.getByRole('dialog', { name: 'AI 工作流构建 Session' }).waitFor({ state: 'detached' });
+    assistantScopeChecks.push(
+      await page.getByRole('button', { name: 'AI 构建', exact: true }).count() === 0
+      && await page.getByRole('dialog', { name: 'AI 工作流构建 Session' }).count() === 0
+    );
+  }
+  await page.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
+  const assistantScopedToOrchestration = assistantAbsentOutsideOrchestrationAtStartup
+    && assistantScopeChecks.every(Boolean)
+    && await page.getByRole('button', { name: 'AI 构建', exact: true }).isVisible()
+    && await page.getByRole('dialog', { name: 'AI 工作流构建 Session' }).count() === 0;
+  await page.getByRole('button', { name: 'AI 构建', exact: true }).click();
 
   const composer = page.getByRole('textbox', { name: 'AI 工作流需求' });
   await composer.fill('请调整当前工作流');
   await page.getByRole('button', { name: '发送', exact: true }).click();
   await page.getByRole('alert').getByText(/AI 工作流服务返回空响应/).waitFor();
-  const timeoutStopsSpinner = await page.locator('.assistant-stages .spin').count() === 0
+  const timeoutStopsSpinner = await page.locator('.assistant-activity .spin').count() === 0
     && await page.getByRole('button', { name: '重新尝试' }).isVisible()
     && await page.getByRole('button', { name: '切换模型' }).isVisible()
+    && await page.getByRole('button', { name: '导出日志' }).isVisible()
     && await page.getByRole('alert').getByText('ASSISTANT_EMPTY_RESPONSE').isVisible()
     && await page.getByRole('alert').getByText(/proxy-empty-1/).isVisible();
+  const sessionLogDownloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: '导出日志' }).click();
+  const sessionLogDownload = await sessionLogDownloadPromise;
+  const sessionLogPath = await sessionLogDownload.path();
+  const sessionLogContent = fs.readFileSync(sessionLogPath, 'utf8');
+  const sessionLogExported = sessionLogDownload.suggestedFilename().endsWith('.session.log')
+    && sessionLogContent.includes('WORKFLOW ASSISTANT SESSION LOG')
+    && sessionLogContent.includes('请调整当前工作流')
+    && sessionLogContent.includes('ASSISTANT_EMPTY_RESPONSE')
+    && !sessionLogContent.includes('assistant-browser-key');
   await page.screenshot({ path: path.join(screenshotDir, 'workflow-assistant-timeout-state.png'), fullPage: true });
   await page.getByRole('button', { name: '重新尝试' }).click();
   await page.getByText(/请确认输入与输出：输入为/).last().waitFor();
-  const asksBeforeDrafting = await page.getByText('待确认输入输出').isVisible();
+  const asksBeforeDrafting = await page.locator('.assistant-contract > summary').isVisible()
+    && await page.getByRole('button', { name: '是', exact: true }).isVisible();
   const structuredConfirmationVisible = await page.getByRole('button', { name: '是', exact: true }).isVisible()
     && await page.getByRole('button', { name: '否', exact: true }).isVisible()
     && await page.getByRole('button', { name: '其他', exact: true }).isVisible();
@@ -163,10 +198,17 @@ try {
   await page.getByText(/保留稳定结构的商品文案/).last().waitFor();
   await page.getByRole('button', { name: '是', exact: true }).click();
   await page.getByText('草案已通过严格校验').waitFor();
-  const strictStagesVisible = await page.getByText('校验流程结构', { exact: true }).isVisible() && await page.getByText('审查任务覆盖', { exact: true }).isVisible();
+  const stageDetailsCollapsedByDefault = !(await page.locator('.assistant-activity-details').getAttribute('open'));
+  await page.locator('.assistant-activity-details > summary').click();
+  const strictStagesProgressiveDisclosure = stageDetailsCollapsedByDefault
+    && await page.getByText('校验流程结构', { exact: true }).isVisible()
+    && await page.getByText('审查任务覆盖', { exact: true }).isVisible();
+  const planExplanationCollapsedByDefault = !(await page.locator('.assistant-plan-explanation').getAttribute('open'));
+  await page.locator('.assistant-plan-explanation > summary').click();
   const planPreviewVisible = await page.getByRole('region', { name: 'AI 流程方案预览' }).isVisible()
     && await page.getByLabel('工作流流程图').isVisible()
     && await page.getByText('流程图是节点与连线的唯一来源').isVisible()
+    && planExplanationCollapsedByDefault
     && await page.getByText('传递生成文案 · text').isVisible();
   const compressionVisible = await page.getByText(/已自动压缩 8 条较早消息/).isVisible();
   const canvasStillUntouched = await page.locator('.flow-node').count() === originalNodeCount;
@@ -175,10 +217,12 @@ try {
   const composerAfterDraft = page.getByRole('textbox', { name: 'AI 工作流需求' });
   await composerAfterDraft.fill('将生成卖点调整为更精简的表达');
   await page.getByRole('button', { name: '发送', exact: true }).click();
-  await page.getByText('正在生成新版流程方案').waitFor();
+  await page.locator('.assistant-activity.running').waitFor();
+  await page.waitForTimeout(1_050);
+  const currentStepAndElapsedVisible = await page.locator('.assistant-activity-main strong').isVisible()
+    && /^0:0[1-9]$/.test(await page.locator('.assistant-activity-main time').innerText());
   await page.screenshot({ path: path.join(screenshotDir, 'workflow-assistant-adjustment-pending.png'), fullPage: true });
   const previousDraftLockedDuringAdjustment = await page.getByRole('button', { name: '确认并应用' }).count() === 0
-    && await page.getByText('上一版已锁定，等待本轮校验链完成').isVisible()
     && await page.getByText('草案已通过严格校验').count() === 0;
   await page.getByText('AI 商品文案工作流 v2').waitFor();
 
@@ -194,8 +238,13 @@ try {
   const draftAppliedAfterConfirmation = await page.locator('.flow-node').count() === 4 && await page.getByRole('main').getByText('AI 商品文案工作流 v2', { exact: true }).first().isVisible();
   await page.waitForTimeout(950);
   await page.reload({ waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
   await page.getByRole('button', { name: 'AI 构建', exact: true }).click();
   const sessionPersistsAfterReload = await page.getByText('已应用').first().isVisible() && await page.getByText('草案已经通过结构校验和独立 Critic，等待确认应用。').last().isVisible();
+  await page.setViewportSize({ width: 420, height: 800 });
+  await page.waitForTimeout(250);
+  const compactPanelBox = await page.getByRole('dialog', { name: 'AI 工作流构建 Session' }).boundingBox();
+  const compactAssistantFitsViewport = Boolean(compactPanelBox && compactPanelBox.x >= -0.5 && compactPanelBox.x + compactPanelBox.width <= 420.5);
   const requestIsBounded = requests.length === 5
     && requests.every((entry) => entry.headers['x-aiflow-api-key'] === 'assistant-browser-key')
     && requests.every((entry) => !JSON.stringify(entry.body).includes('assistant-browser-key'))
@@ -208,7 +257,7 @@ try {
     && requests[4].body.providers[0].apiKey === undefined;
 
   const unexpectedConsoleProblems = consoleProblems.filter((entry) => !/status of 504 \(Gateway Timeout\)/.test(entry));
-  const result = { panelVisible, systemSkillLocked, criticDefaultsIsolated, timeoutStopsSpinner, asksBeforeDrafting, structuredConfirmationVisible, canvasUntouchedBeforeConfirmation, strictStagesVisible, planPreviewVisible, compressionVisible, canvasStillUntouched, previousDraftLockedDuringAdjustment, staleDraftBlocked, draftAppliedAfterConfirmation, sessionPersistsAfterReload, requestIsBounded, consoleProblems: unexpectedConsoleProblems, pageErrors };
+  const result = { panelVisible, reportButtonVisible, systemSkillLocked, criticDefaultsIsolated, assistantScopedToOrchestration, timeoutStopsSpinner, sessionLogExported, asksBeforeDrafting, structuredConfirmationVisible, canvasUntouchedBeforeConfirmation, strictStagesProgressiveDisclosure, planPreviewVisible, compressionVisible, canvasStillUntouched, currentStepAndElapsedVisible, previousDraftLockedDuringAdjustment, staleDraftBlocked, draftAppliedAfterConfirmation, sessionPersistsAfterReload, compactAssistantFitsViewport, requestIsBounded, consoleProblems: unexpectedConsoleProblems, pageErrors };
   console.log(JSON.stringify(result, null, 2));
   if (Object.entries(result).some(([key, value]) => !['consoleProblems', 'pageErrors'].includes(key) && value !== true) || unexpectedConsoleProblems.length || pageErrors.length) process.exitCode = 1;
 } finally {

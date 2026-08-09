@@ -65,6 +65,7 @@ try {
   if (Date.now() >= deadline) throw new Error(`gateway failed to start:\n${gatewayOutput}`);
 
   await page.goto(origin, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
   await page.locator('.flow-node').filter({ hasText: '推理节点' }).click();
   const reasoningSelect = page.getByRole('combobox', { name: '思考强度' });
   const reasoningDefaultsHigh = await reasoningSelect.inputValue() === 'high';

@@ -59,6 +59,7 @@ try {
   });
 
   await page.goto(origin, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
   await page.getByRole('button', { name: /电商场景预设/ }).click();
   const preset = page.locator('.preset-card').filter({ hasText: '多渠道营销套图' });
   await preset.getByRole('button', { name: '使用模板' }).click();

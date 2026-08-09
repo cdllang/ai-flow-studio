@@ -58,6 +58,38 @@ const draft = (providerId = 'provider-main', prompt = '根据商品说明生成�
   edges: []
 });
 
+const draftWithRedundantTransitiveEdge = () => ({
+  schema: 'aiflow.workflow-draft',
+  schemaVersion: 1,
+  title: '创意结果生成器',
+  plan: {
+    schema: 'aiflow.workflow-plan',
+    schemaVersion: 1,
+    summary: '规划创意、生成内容并聚合结果。',
+    steps: [
+      { id: 'start-1', kind: 'start', title: '开始', purpose: '接收商品说明', inputs: [], outputs: ['商品说明'] },
+      { id: 'creative-planner', kind: 'llm', title: '创意规划', purpose: '规划创意方向', inputs: ['商品说明'], outputs: ['创意方案'] },
+      { id: 'creative-writer', kind: 'llm', title: '创意写作', purpose: '撰写商品文案', inputs: ['创意方案'], outputs: ['商品文案'] },
+      { id: 'result-aggregate', kind: 'aggregate', title: '结果聚合', purpose: '聚合生成结果', inputs: ['商品文案'], outputs: ['聚合结果'] },
+      { id: 'output-1', kind: 'output', title: '输出', purpose: '交付聚合结果', inputs: ['聚合结果'], outputs: [] }
+    ],
+    connections: [
+      { id: 'edge-start-planner', source: 'start-1', target: 'creative-planner', reason: '传递商品说明', dataType: 'text' },
+      { id: 'edge-planner-writer', source: 'creative-planner', target: 'creative-writer', reason: '传递创意方案', dataType: 'text' },
+      { id: 'edge-writer-aggregate', source: 'creative-writer', target: 'result-aggregate', reason: '传递商品文案', dataType: 'text' },
+      { id: 'edge-planner-aggregate', source: 'creative-planner', target: 'result-aggregate', reason: '跨级传递创意方案', dataType: 'text' },
+      { id: 'edge-aggregate-output', source: 'result-aggregate', target: 'output-1', reason: '交付聚合结果', dataType: 'text' }
+    ]
+  },
+  nodes: [
+    { id: 'start-1', type: 'flowNode', data: { kind: 'start', title: '开始', subtitle: '商品说明', status: 'idle' } },
+    { id: 'creative-planner', type: 'flowNode', data: { kind: 'llm', title: '创意规划', subtitle: 'text-model', status: 'idle', providerId: 'missing-provider', model: 'text-model', prompt: '规划创意方向' } },
+    { id: 'creative-writer', type: 'flowNode', data: { kind: 'llm', title: '创意写作', subtitle: 'text-model', status: 'idle', providerId: 'provider-main', model: 'text-model', prompt: '撰写商品文案' } },
+    { id: 'result-aggregate', type: 'flowNode', data: { kind: 'aggregate', title: '结果聚合', subtitle: '聚合生成结果', status: 'idle' } },
+    { id: 'output-1', type: 'flowNode', data: { kind: 'output', title: '输出', subtitle: '聚合结果', status: 'idle' } }
+  ]
+});
+
 test('workflow assistant auto-applies the system Skill, repairs invalid drafts, isolates Critic, and compresses sessions', async () => {
   const calls = [];
   let formatFailureInjected = false;
@@ -83,7 +115,7 @@ test('workflow assistant auto-applies the system Skill, repairs invalid drafts, 
     } else if (system.includes('Independent Workflow Critic')) {
       content = JSON.stringify({ passed: true, issues: [] });
     } else if (system.includes('Repair entrypoint')) {
-      content = JSON.stringify({ status: 'draft_ready', message: '修复完成', contract, questions: [], draft: draft() });
+      content = JSON.stringify({ status: 'success', message: '修复完成', draft: draft() });
     } else if ((() => { try { return JSON.parse(prompt).latestMessage?.includes('clarify'); } catch { return false; } })()) {
       const validClarification = JSON.stringify({
         status: 'needs_clarification',
@@ -96,7 +128,7 @@ test('workflow assistant auto-applies the system Skill, repairs invalid drafts, 
         content = `${validClarification}\n${JSON.stringify({ status: 'blocked', message: '冲突对象', contract, questions: [] })}`;
       } else content = validClarification;
     } else {
-      content = JSON.stringify({ status: 'draft_ready', message: '草案已生成', contract, questions: [], draft: draft('missing-provider', '') });
+      content = JSON.stringify({ status: 'draft_ready', message: '草案已生成', contract, questions: [], draft: draftWithRedundantTransitiveEdge() });
     }
     response.setHeader('Content-Type', 'application/json');
     response.end(JSON.stringify({ choices: [{ message: { content } }], model: body.model, usage: { total_tokens: 100 } }));

@@ -276,9 +276,26 @@ export function normalizeAssistantEnvelope(value) {
   return { status, message, contract, questions, ...(value.draft ? { draft: clone(value.draft) } : {}), ...(value.changeSet ? { changeSet: clone(value.changeSet) } : {}) };
 }
 
+export function normalizeWorkflowRepairResponse(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Repair response must be an object');
+  const directDraft = value.schema === 'aiflow.workflow-draft' ? value : null;
+  const embeddedDraft = value.draft && typeof value.draft === 'object' && !Array.isArray(value.draft) ? value.draft : null;
+  const draft = embeddedDraft || directDraft;
+  if (!draft) throw new Error('Repair response must contain a workflow draft');
+  return { message: directDraft ? '' : text(value.message, 5_000), draft: clone(draft) };
+}
+
 const workflowPlan = (draft) => draft?.plan && typeof draft.plan === 'object' && !Array.isArray(draft.plan) ? draft.plan : null;
 
 const planEdgeSignature = (edge) => `${text(edge?.source, 100)}::${text(edge?.target, 100)}::${text(edge?.sourceHandle, 20)}`;
+
+const nodeHasExplicitSourceDependency = (node, sourceId) => {
+  const prefix = `${sourceId}.`;
+  const inputMapping = node?.data?.inputMapping;
+  const mappedInputs = inputMapping && typeof inputMapping === 'object' && !Array.isArray(inputMapping) ? Object.values(inputMapping) : [];
+  const outputBindings = Array.isArray(node?.data?.outputBindings) ? node.data.outputBindings.map((binding) => binding?.source) : [];
+  return [...mappedInputs, ...outputBindings].some((reference) => typeof reference === 'string' && reference.trim().startsWith(prefix));
+};
 
 export function compileWorkflowDraft(draft) {
   if (!draft || typeof draft !== 'object' || Array.isArray(draft)) return draft;
@@ -439,7 +456,7 @@ export function validateWorkflowDraft(draft, options = {}) {
       else if (!Array.isArray(provider.models) || !provider.models.some((model) => model.id === data.model && model.capability === capability)) issues.push(issue('provider', 'MODEL_NOT_FOUND', '节点引用了该供应商未声明的模型', { nodeId: node.id }));
       if (data.kind === 'llm' && !text(data.prompt, 20_000)) issues.push(issue('node-config', 'PROMPT_REQUIRED', '大模型节点必须包含提示词', { nodeId: node.id }));
     }
-    if (data.kind === 'condition' && !['contains', 'not_contains', 'equals', 'not_equals'].includes(data.conditionOperator)) issues.push(issue('node-config', 'CONDITION_OPERATOR_INVALID', '条件节点运算符无效', { nodeId: node.id }));
+    if (data.kind === 'condition' && !['contains', 'not_contains', 'equals', 'not_equals'].includes(data.conditionOperator)) issues.push(issue('node-config', 'CONDITION_OPERATOR_INVALID', '条件节点运算符仅支持 contains、not_contains、equals 或 not_equals', { nodeId: node.id, suggestedFix: '将 conditionOperator 设置为 contains、not_contains、equals 或 not_equals 之一' }));
   }
   plan.steps.filter((step) => !nodeIds.has(step.id)).forEach((step) => issues.push(issue('plan', 'PLAN_STEP_NOT_COMPILED', '流程图步骤未编译为画布节点', { nodeId: step.id })));
 
@@ -494,6 +511,7 @@ export function validateWorkflowDraft(draft, options = {}) {
 
   for (const edge of draft.edges) {
     if (!nodeIds.has(edge?.source) || !nodeIds.has(edge?.target)) continue;
+    if (nodeHasExplicitSourceDependency(nodeById.get(edge.target), edge.source)) continue;
     const excluded = planEdgeSignature(edge);
     const pending = [edge.source];
     const visited = new Set();

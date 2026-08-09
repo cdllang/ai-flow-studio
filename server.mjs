@@ -17,6 +17,7 @@ import {
   normalizeAssistantEnvelope,
   normalizeAssistantSession,
   normalizeTaskContract,
+  normalizeWorkflowRepairResponse,
   publicAssistantProviderCatalog,
   resolveAssistantModelTimeout,
   shouldCompressSession,
@@ -362,7 +363,7 @@ app.post('/api/workflow-assistant/turn', async (req, res) => {
   }
 
   const applyAuthoritativeConstraints = (contract) => ({ ...normalizeTaskContract(contract), constraints: { ...normalizeTaskContract(contract).constraints, ...authoritativeConstraints } });
-  const builderSystem = `${workflowAssistantSkill.builder}\n\n${workflowAssistantSkill.contracts}\n\nYou are the Builder entrypoint. Return exactly one JSON AssistantTurn object and no markdown. WorkflowPlan is the sole source of truth: define every step, responsibility, input/output, and justified connection there first. The application will ignore model-authored positions and compile canvas edges exclusively from WorkflowPlan.connections. Use only the supplied node, provider, and model catalogs. Every draft node status must be idle. Treat a supplied confirmation object as the user's authoritative answer to that exact question. The only user-facing clarification allowed is confirmation of the inferred inputs and outputs. Infer scope, exclusions, acceptance criteria, permissions, budgets, and implementation details using safe defaults; never ask the user to confirm them. The application itself will render the one input/output confirmation question.`;
+  const builderSystem = `${workflowAssistantSkill.builder}\n\n${workflowAssistantSkill.contracts}\n\nYou are the Builder entrypoint. Return exactly one JSON AssistantTurn object and no markdown. WorkflowPlan is the sole source of truth: define every step, responsibility, input/output, and justified connection there first. The application will ignore model-authored positions and compile canvas edges exclusively from WorkflowPlan.connections. Use only the supplied node, provider, and model catalogs. Every draft node status must be idle. Condition nodes must set conditionOperator to exactly one of contains, not_contains, equals, or not_equals. Treat a supplied confirmation object as the user's authoritative answer to that exact question. The only user-facing clarification allowed is confirmation of the inferred inputs and outputs. Infer scope, exclusions, acceptance criteria, permissions, budgets, and implementation details using safe defaults; never ask the user to confirm them. The application itself will render the one input/output confirmation question.`;
   let envelope;
   let intentStageIndex = -1;
   try {
@@ -465,13 +466,12 @@ app.post('/api/workflow-assistant/turn', async (req, res) => {
     try {
       const repairedJson = await callStructuredModel({
         ...builder,
-        system: `${workflowAssistantSkill.builder}\n\n${workflowAssistantSkill.contracts}\n\nYou are the Repair entrypoint. Return one complete draft_ready AssistantTurn JSON object. WorkflowPlan remains the sole source of truth; repair the plan first and keep node configs aligned with its step ids and kinds. Do not add direct or transitive connections when an existing path already carries the same dependency. Preserve the contract and change only allow-listed workflow draft fields. Never change permissions, provider credentials, schema version, validation state, or repair counters.`,
+        system: `${workflowAssistantSkill.builder}\n\n${workflowAssistantSkill.contracts}\n\nYou are the Repair entrypoint. Return exactly one JSON object with only \"message\" and the complete repaired \"draft\". Do not return AssistantTurn status, contract, questions, validation, or repair counters. WorkflowPlan remains the sole source of truth; repair the plan first and keep node configs aligned with its step ids and kinds. Condition nodes must set conditionOperator to exactly one of contains, not_contains, equals, or not_equals. Remove a direct connection only when another path carries the same specific dependency unchanged. Topological reachability alone is not redundancy: preserve a direct edge whenever the target inputMapping or output binding reads sourceId.field, or the alternate path carries a transformed or different data value. Preserve the authoritative contract supplied by the application and change only allow-listed workflow draft fields. Never change permissions, provider credentials, schema version, validation state, or repair counters.`,
         prompt: JSON.stringify({ contract: envelope.contract, candidateDraft, validation: report, currentWorkflow, providers: providerCatalog, permissions: authoritativeConstraints })
-      }, 'AssistantTurn');
-      const repaired = normalizeAssistantEnvelope(repairedJson);
-      if (repaired.status !== 'draft_ready' || !repaired.draft) throw new Error('修复模型未返回完整草案');
+      }, 'WorkflowRepair');
+      const repaired = normalizeWorkflowRepairResponse(repairedJson);
       candidateDraft = bindCandidateModels(compileWorkflowDraft(repaired.draft));
-      envelope.message = repaired.message;
+      envelope.message = repaired.message || envelope.message;
       stages[repairStageIndex] = { stage: 'repair', status: 'success', detail: `第 ${repairAttempt} 轮修复已生成，重新执行全部检查` };
       publishStage(repairStageIndex);
     } catch (error) {

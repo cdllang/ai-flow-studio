@@ -20,7 +20,8 @@
     "verify:partial-failure": "node scripts/verify-partial-failure.mjs",
     "verify:reasoning-drag": "node scripts/verify-reasoning-drag.mjs",
     "verify:skills": "node scripts/verify-skills.mjs",
-    "verify:assistant": "node scripts/verify-workflow-assistant.mjs"
+    "verify:assistant": "node scripts/verify-workflow-assistant.mjs",
+    "verify:library": "node scripts/verify-library-navigation.mjs"
   },
   "dependencies": {
     "@xyflow/react": "^12.9.2",

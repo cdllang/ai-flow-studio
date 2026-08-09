@@ -20,8 +20,10 @@ page.on('console', (message) => {
 });
 page.on('pageerror', (error) => pageErrors.push(error.message));
 await page.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
+const libraryIsDefault = await page.getByRole('heading', { name: '工作流库', exact: true }).isVisible();
+await page.getByRole('button', { name: '使用工作流', exact: true }).first().click();
+await page.locator('.test-input > button').click();
 const autoProviderPage = await page.getByText('管理供应商网关、API Key 与节点可选模型').isVisible();
-await page.getByRole('button', { name: '试运行' }).click();
 const runBlockedOnProviderPage = await page.getByText('管理供应商网关、API Key 与节点可选模型').isVisible();
 await page.screenshot({ path: path.join(screenshotDir, 'auto-config-modal.png'), fullPage: true });
 
@@ -53,6 +55,7 @@ await mockPage.route('**/api/images', async (route) => {
 });
 
 await mockPage.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
+await mockPage.getByRole('button', { name: '使用工作流', exact: true }).first().click();
 await mockPage.locator('#reference-image-input').setInputFiles('public/assets/case-template-1.jpg');
 await mockPage.getByAltText('参考图片预览').waitFor();
 const referencePreview = await mockPage.getByAltText('参考图片预览').isVisible();
@@ -79,6 +82,7 @@ const compactLayout = await mockPage.evaluate(() => ({
 }));
 
 const result = {
+  libraryIsDefault,
   autoProviderPage,
   runBlockedOnProviderPage,
   referencePreview,

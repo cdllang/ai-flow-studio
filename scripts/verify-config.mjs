@@ -72,7 +72,8 @@ const storedProvider = await page.evaluate(() => {
   return store.providers.find((provider) => provider.name === '双能力供应商');
 });
 
-await page.getByRole('button', { name: '编排', exact: true }).click();
+await page.getByRole('button', { name: '返回工作流库', exact: true }).click();
+await page.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
 await page.locator('.flow-node').filter({ hasText: '生成视觉方案' }).click();
 await page.getByRole('combobox', { name: '节点供应商连接' }).selectOption({ label: '双能力供应商' });
 await page.getByRole('combobox', { name: '节点模型 ID' }).selectOption('vendor-chat-pro');

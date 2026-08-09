@@ -31,7 +31,7 @@ Read `references/contracts.md` before normalizing intent or producing a draft. R
 - Preserve the selected provider and model unless the user asks to change them or the reference is invalid.
 - Prefer the smallest graph that satisfies the contract. Reject ornamental nodes that do not contribute to a required output.
 - Give every plan step a concrete purpose, named inputs, and named outputs. Give every connection a data type and a reason.
-- Reject duplicate connections, redundant transitive connections, and multiple primary inputs into ordinary processing nodes. Use one aggregate node when several branches must merge.
+- Reject duplicate connections, truly redundant transitive connections, and multiple primary inputs into ordinary processing nodes. Graph reachability alone does not make a direct edge redundant: preserve it when the target `inputMapping` or output binding reads a field from that source, or when the alternate path carries a transformed or different value. Use one aggregate node when several branches must merge.
 - Keep existing valid branches when adjusting a workflow. Describe every node or edge added, changed, or removed.
 - Treat missing, deleted, or incompatible providers, models, Skills, variables, and output bindings as blocking errors.
 - Stop after the repair limit. Return the last safe draft and complete diagnostics without changing the active canvas.

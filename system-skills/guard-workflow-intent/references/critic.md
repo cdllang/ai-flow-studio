@@ -13,10 +13,11 @@ Accept only the confirmed `TaskContract`, canonical candidate workflow without a
 1. Map every acceptance criterion to one or more concrete nodes and reachable outputs.
 2. Verify that every required input reaches each consumer that needs it.
 3. Check branch completeness, join behavior, multi-output preservation, and failure isolation.
+   For every condition node, require `conditionOperator` to be exactly `contains`, `not_contains`, `equals`, or `not_equals`, and require complete `true`/`false` outgoing branches.
 4. Check that prompts can obtain every variable they reference.
 5. Detect destructive scope expansion, unauthorized HTTP/code behavior, invented providers/models/Skills, and unnecessary model calls.
 6. For adjustments, verify that unrelated valid behavior is preserved.
-7. Verify that the plan is minimal and readable: no duplicate edge, no redundant transitive edge, no unexplained connection, and no ordinary processing node with multiple primary upstreams.
+7. Verify that the plan is minimal and readable: no duplicate edge, no truly redundant transitive edge, no unexplained connection, and no ordinary processing node with multiple primary upstreams. Do not treat graph reachability alone as redundancy; a direct edge is required when the target `inputMapping` or output binding reads a field from that source, or when the alternate path carries a transformed or different value.
 8. Verify that every read-only compiled canvas node and connection can be traced to the supplied WorkflowPlan, and that every plan step contributes to a reachable output. Accept compiler-derived edges when they match `plan.connections`.
 9. Reject vague evidence such as “looks correct”. Cite node IDs, connection IDs, contract fields, or deterministic facts.
 

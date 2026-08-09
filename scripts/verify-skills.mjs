@@ -85,7 +85,8 @@ try {
   });
   await page.screenshot({ path: path.join(screenshotDir, 'skill-center-hybrid-storage.png'), fullPage: true });
 
-  await page.getByRole('button', { name: '编排', exact: true }).click();
+await page.getByRole('button', { name: '返回工作流库', exact: true }).click();
+await page.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
   await page.locator('.flow-node').filter({ hasText: '提示词专家' }).click();
   const enableSkill = page.getByRole('button', { name: '启用 Skill GPT Image 2' });
   const skillListed = await enableSkill.isVisible() && await page.getByText('服务器 · Advisor').isVisible();

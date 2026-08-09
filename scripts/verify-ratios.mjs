@@ -23,6 +23,7 @@ await page.route('**/api/images', (route) => {
 });
 
 await page.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
+await page.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
 await page.locator('.flow-node').filter({ hasText: '生成主视觉' }).click();
 const presetCount = await page.locator('.ratio-preset-grid > button').count();
 await page.getByRole('button', { name: '16:9 1536 × 864' }).click();

@@ -20,10 +20,11 @@ await page.route('**/api/config/status', (route) => route.fulfill({
 }));
 
 await page.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
+await page.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
 await page.locator('.header-center').getByRole('button', { name: '模型服务' }).click();
 const debugHiddenOutsideEditor = await page.locator('.debug-panel, .debug-window, .debug-minimized-pill').count() === 0;
 
-await page.locator('.header-center').getByRole('button', { name: '编排' }).click();
+await page.locator('.header-center').getByRole('button', { name: '编排', exact: true }).click();
 await page.getByRole('button', { name: 'AI 构建' }).click();
 await page.locator('.workflow-assistant').waitFor();
 const headerLayerAboveAssistant = await page.evaluate(() => {

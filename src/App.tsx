@@ -21,7 +21,6 @@ import {
 } from '@xyflow/react';
 import {
   ArrowDownToLine,
-  ArrowLeft,
   Bot,
   Braces,
   Check,
@@ -37,10 +36,13 @@ import {
   FileText,
   GitBranch,
   GripVertical,
+  House,
   Image as ImageIcon,
   KeyRound,
   LayoutTemplate,
+  Library,
   LoaderCircle,
+  LockKeyhole,
   Maximize2,
   Menu,
   MessageSquareText,
@@ -50,9 +52,11 @@ import {
   PanelBottomClose,
   PanelLeftOpen,
   PanelRightOpen,
+  PencilLine,
   Play,
   Plus,
   Rocket,
+  Save,
   Search,
   Settings,
   Sparkles,
@@ -68,6 +72,8 @@ import { OutputPanel } from './components/OutputPanel';
 import { ProviderManager } from './components/ProviderManager';
 import { SkillManager } from './components/SkillManager';
 import { WorkflowAssistant } from './components/WorkflowAssistant';
+import { WorkflowLibrary } from './components/WorkflowLibrary';
+import { WorkflowSaveDialog } from './components/WorkflowSaveDialog';
 import {
   assistantSessionStorageKey,
   createWorkflowAssistantSession,
@@ -111,6 +117,20 @@ import {
   type WorkflowOutputBundle
 } from './workflow/core';
 import { ecommerceWorkflowPresets, instantiatePreset, type WorkflowPreset } from './workflow/presets';
+import {
+  cloneWorkflowLibraryDefinition,
+  createWorkflowLibraryItem,
+  markWorkflowLibraryRun,
+  normalizeWorkflowLibrary,
+  upsertWorkflowLibraryItem,
+  workflowLibraryStorageKey,
+  type WorkflowLibraryItem
+} from './workflow/library';
+import {
+  canShowWorkflowWorkspaceNavigation,
+  canUseWorkflowAssistant,
+  type WorkspaceView
+} from './workspaceView';
 
 type NodeKind = 'start' | 'llm' | 'image' | 'condition' | 'http' | 'code' | 'aggregate' | 'output';
 type NodeStatus = 'idle' | 'waiting' | 'running' | 'success' | 'error' | 'skipped' | 'cancelled';
@@ -225,6 +245,8 @@ type VersionRecord = {
   edges: Edge[];
 };
 
+type SavedWorkflow = WorkflowLibraryItem<Node<FlowData>, Edge>;
+
 type ReferenceImage = {
   name: string;
   type: string;
@@ -335,6 +357,54 @@ const initialEdges: Edge[] = [
   { id: 'e-image-output', source: 'image-1', target: 'output-1', animated: false }
 ];
 
+function createBlankWorkflowSnapshot(seed = Date.now()): WorkflowSnapshot {
+  const startId = `start-${seed}`;
+  const outputId = `output-${seed}`;
+  return {
+    nodes: [
+      {
+        id: startId,
+        type: 'flowNode',
+        position: { x: 180, y: 260 },
+        data: { kind: 'start', title: '工作流输入', subtitle: '定义这条流程接收的内容', status: 'idle' }
+      },
+      {
+        id: outputId,
+        type: 'flowNode',
+        position: { x: 700, y: 260 },
+        data: { kind: 'output', title: '工作流输出', subtitle: '汇总并返回执行结果', status: 'idle' }
+      }
+    ],
+    edges: [{ id: `edge-${seed}`, source: startId, target: outputId, animated: false }]
+  };
+}
+
+function workflowDraftFingerprint(title: string, input: string, nodes: Node<FlowData>[], edges: Edge[]) {
+  return JSON.stringify({
+    title,
+    input,
+    nodes: nodes.map((node) => ({
+      id: node.id,
+      type: node.type,
+      position: node.position,
+      data: { ...node.data, status: 'idle' }
+    })),
+    edges: edges.map((edge) => ({
+      id: edge.id,
+      source: edge.source,
+      target: edge.target,
+      sourceHandle: edge.sourceHandle,
+      targetHandle: edge.targetHandle,
+      type: edge.type,
+      data: edge.data,
+      animated: edge.animated
+    }))
+  });
+}
+
+const initialWorkflowTitle = '社媒主视觉生成器';
+const initialWorkflowInput = '为一家专注 AI 效率工具的中文品牌设计一张社交媒体主视觉，克制、专业、有技术感。';
+
 function loadSavedWorkflow() {
   try {
     const raw = localStorage.getItem('aiflow.demo.workflow');
@@ -398,6 +468,40 @@ function cleanSnapshot(nodes: Node<FlowData>[], edges: Edge[]): WorkflowSnapshot
     nodes: nodes.map((node) => ({ ...node, data: { ...node.data, status: 'idle' } })),
     edges: edges.map((edge) => ({ ...edge }))
   };
+}
+
+function loadStoredWorkflowLibrary(savedWorkflow: ReturnType<typeof loadSavedWorkflow>): SavedWorkflow[] {
+  try {
+    const normalized = normalizeWorkflowLibrary(JSON.parse(localStorage.getItem(workflowLibraryStorageKey) || '[]')) as SavedWorkflow[];
+    if (normalized.length) return normalized;
+  } catch {
+    // A malformed library should not prevent the editor from opening.
+  }
+
+  const now = new Date().toISOString();
+  const currentSnapshot = cleanSnapshot(savedWorkflow?.nodes ?? initialNodes, savedWorkflow?.edges ?? initialEdges);
+  const current = createWorkflowLibraryItem<Node<FlowData>, Edge>({
+    id: 'workflow-social-visual',
+    title: savedWorkflow?.title ?? initialWorkflowTitle,
+    description: '根据品牌主题自动生成视觉方案与社交媒体主视觉，适合日常内容发布和活动预热。',
+    input: savedWorkflow?.input ?? initialWorkflowInput,
+    ...currentSnapshot
+  }, now);
+  const examples = ecommerceWorkflowPresets.slice(0, 3).map((preset, index) => {
+    const instance = instantiatePreset(preset);
+    return createWorkflowLibraryItem<Node<FlowData>, Edge>({
+      id: `workflow-preset-${preset.id}`,
+      title: instance.name,
+      description: preset.description,
+      input: instance.sampleInput,
+      nodes: instance.nodes as unknown as Node<FlowData>[],
+      edges: instance.edges as Edge[],
+      createdAt: new Date(Date.now() - (index + 1) * 86_400_000).toISOString(),
+      updatedAt: new Date(Date.now() - (index + 1) * 86_400_000).toISOString(),
+      runCount: Math.max(1, 8 - index * 2)
+    }, now);
+  });
+  return [current, ...examples];
 }
 
 function abortableDelay(ms: number, signal: AbortSignal) {
@@ -494,6 +598,7 @@ function BrandMark() {
 
 function App() {
   const savedWorkflow = useMemo(loadSavedWorkflow, []);
+  const initialWorkflowLibrary = useMemo(() => loadStoredWorkflowLibrary(savedWorkflow), [savedWorkflow]);
   const initialProviders = useMemo(loadStoredProviders, []);
   const initialAssistantConnection = useMemo(() => resolveNodeProvider(initialProviders, 'chat'), [initialProviders]);
   const [providers, setProviders] = useState<ModelProvider[]>(initialProviders);
@@ -515,15 +620,20 @@ function App() {
   const minimapDragRef = useRef<{ sx: number; sy: number; originLeft: number; originTop: number; flowW: number; flowH: number; moved: boolean } | null>(null);
   const [libraryOpen, setLibraryOpen] = useState(true);
   const [configPanelOpen, setConfigPanelOpen] = useState(true);
-  const [workspaceView, setWorkspaceView] = useState<'editor' | 'models' | 'skills' | 'runs' | 'versions'>(() => initialProviders.some((provider) => provider.apiKey) ? 'editor' : 'models');
+  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('library');
+  const [workspaceReturnView, setWorkspaceReturnView] = useState<'library' | 'editor' | 'runner'>('library');
   const [undoStack, setUndoStack] = useState<WorkflowSnapshot[]>([]);
   const [runRecords, setRunRecords] = useState<RunRecord[]>(() => loadStoredList<RunRecord>('aiflow.demo.runs').map((record) => ({ ...record, result: coerceOutputBundle(record.result) })));
   const [versions, setVersions] = useState<VersionRecord[]>(() => loadStoredList<VersionRecord>('aiflow.demo.versions'));
+  const [savedWorkflows, setSavedWorkflows] = useState<SavedWorkflow[]>(initialWorkflowLibrary);
+  const [activeLibraryWorkflowId, setActiveLibraryWorkflowId] = useState<string | null>(initialWorkflowLibrary[0]?.id ?? null);
+  const [workflowSaveOpen, setWorkflowSaveOpen] = useState(false);
+  const [editorBaseline, setEditorBaseline] = useState<string | null>(null);
   const [toast, setToast] = useState('');
   const [nodeSearch, setNodeSearch] = useState('');
-  const [workflowTitle, setWorkflowTitle] = useState(savedWorkflow?.title ?? '社媒主视觉生成器');
+  const [workflowTitle, setWorkflowTitle] = useState(savedWorkflow?.title ?? initialWorkflowTitle);
   const [presetOpen, setPresetOpen] = useState(false);
-  const [input, setInput] = useState(savedWorkflow?.input ?? '为一家专注 AI 效率工具的中文品牌设计一张社交媒体主视觉，克制、专业、有技术感。');
+  const [input, setInput] = useState(savedWorkflow?.input ?? initialWorkflowInput);
   const [running, setRunning] = useState(false);
   const [runLogs, setRunLogs] = useState<RunLog[]>([
     { id: 'hint', title: '等待运行', detail: '填写测试输入，然后点击右上角“试运行”', status: 'muted' }
@@ -539,7 +649,22 @@ function App() {
   const importWorkflowRef = useRef<HTMLInputElement | null>(null);
   const reactFlowInstanceRef = useRef<ReactFlowInstance<Node<FlowData>, Edge> | null>(null);
   const selectedNode = nodes.find((node) => node.id === selectedId);
+  const activeLibraryWorkflow = savedWorkflows.find((workflow) => workflow.id === activeLibraryWorkflowId) ?? null;
   const configuredProviderCount = providers.filter((provider) => provider.apiKey).length;
+  const editorDirty = useMemo(() => editorBaseline !== null && editorBaseline !== workflowDraftFingerprint(workflowTitle, input, nodes, edges), [editorBaseline, workflowTitle, input, nodes, edges]);
+  const workspaceHeading = workspaceView === 'library' ? '工作流库'
+    : workspaceView === 'models' ? '模型服务'
+      : workspaceView === 'skills' ? 'Skills'
+        : workspaceView === 'runs' ? '运行记录'
+          : workspaceView === 'versions' ? '版本管理'
+            : workflowTitle;
+  const workspaceDetail = workspaceView === 'library' ? `${savedWorkflows.length} 个已保存工作流`
+    : workspaceView === 'runner' ? '只读使用模式'
+      : workspaceView === 'editor' ? (editorDirty ? '有未保存更改' : activeLibraryWorkflow ? '已保存到工作流库' : '新工作流草稿')
+        : workspaceView === 'models' ? `${configuredProviderCount} 个供应商已就绪`
+          : workspaceView === 'skills' ? `${skillCatalog.length + localSkills.length} 个可用 Skill`
+            : workspaceView === 'runs' ? `${runRecords.length} 条运行记录`
+              : `${versions.length} 个本地版本`;
   const selectedCapability: ModelCapability | null = selectedNode?.data.kind === 'llm' ? 'chat' : selectedNode?.data.kind === 'image' ? 'image' : null;
   const selectedProviderOptions = selectedCapability ? providersForCapability(providers, selectedCapability) : [];
   const selectedConnection = selectedCapability ? resolveNodeProvider(providers, selectedCapability, selectedNode?.data.providerId, selectedNode?.data.model) : null;
@@ -551,6 +676,12 @@ function App() {
     return { title: workflowTitle, input, nodes: snapshot.nodes, edges: snapshot.edges };
   }, [nodes, edges, workflowTitle, input]);
   const assistantWorkflowRevision = useMemo(() => workflowRevision(assistantWorkflow), [assistantWorkflow]);
+  const assistantAvailable = canUseWorkflowAssistant(workspaceView);
+  const workflowWorkspaceNavigationVisible = canShowWorkflowWorkspaceNavigation(workspaceView);
+
+  useEffect(() => {
+    if (!assistantAvailable) setAssistantOpen(false);
+  }, [assistantAvailable]);
 
   const rememberDebugMode = () => {
     if (debugMode === 'floating') debugPrevModeRef.current = 'floating';
@@ -574,7 +705,7 @@ function App() {
   const restoreDebug = () => setDebugMode(debugPrevModeRef.current);
 
   const startDebugDrag = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (debugMode === 'fullscreen' || event.button !== 0) return;
+    if (workspaceView === 'runner' || debugMode === 'fullscreen' || event.button !== 0) return;
     if ((event.target as HTMLElement).closest('button')) return;
     event.preventDefault();
     const base = debugMode === 'docked'
@@ -706,6 +837,10 @@ function App() {
     }, 800);
     return () => window.clearTimeout(timer);
   }, [nodes, edges, input, workflowTitle]);
+
+  useEffect(() => {
+    localStorage.setItem(workflowLibraryStorageKey, JSON.stringify(savedWorkflows));
+  }, [savedWorkflows]);
 
   useEffect(() => {
     if (!toast) return;
@@ -879,6 +1014,7 @@ function App() {
         setWorkflowTitle(typeof document.workflow.title === 'string' ? document.workflow.title : file.name.replace(/\.aiflow\.json$|\.json$/i, ''));
         setInput(typeof document.workflow.input === 'string' ? document.workflow.input : '');
         setResult(emptyOutputBundle());
+        setActiveLibraryWorkflowId(null);
         setSelectedId(importedNodes.find((node) => node.data.kind !== 'start')?.id || importedNodes[0]?.id || '');
         setWorkspaceView('editor');
         setToast(`已导入 ${importedNodes.length} 个节点`);
@@ -890,6 +1026,118 @@ function App() {
     reader.readAsText(file);
   };
 
+  const startNewWorkflow = () => {
+    const snapshot = createBlankWorkflowSnapshot();
+    const title = '未命名工作流';
+    setNodes(snapshot.nodes);
+    setEdges(snapshot.edges);
+    setWorkflowTitle(title);
+    setInput('');
+    setSelectedId(snapshot.nodes[0]?.id || '');
+    setActiveLibraryWorkflowId(null);
+    setEditorBaseline(workflowDraftFingerprint(title, '', snapshot.nodes, snapshot.edges));
+    setUndoStack([]);
+    setResult(emptyOutputBundle());
+    setRunLogs([{ id: 'hint', title: '空白工作流已就绪', detail: '从左侧添加节点，完成后保存到工作流库', status: 'muted' }]);
+    setActiveDebug('process');
+    setDebugMode('closed');
+    setLibraryOpen(true);
+    setConfigPanelOpen(false);
+    setAssistantOpen(false);
+    setWorkflowSaveOpen(false);
+    setWorkspaceReturnView('library');
+    setWorkspaceView('editor');
+    setToast('已创建空白工作流');
+  };
+
+  const openLibraryWorkflow = (workflow: SavedWorkflow, view: 'runner' | 'editor') => {
+    const definition = cloneWorkflowLibraryDefinition(workflow);
+    const nextNodes = syncNodeProviders(definition.nodes, providers);
+    setNodes(nextNodes);
+    setEdges(definition.edges);
+    setWorkflowTitle(definition.title);
+    setInput(definition.input);
+    setSelectedId(nextNodes.find((node) => node.data.kind !== 'start')?.id || nextNodes[0]?.id || '');
+    setActiveLibraryWorkflowId(workflow.id);
+    setEditorBaseline(workflowDraftFingerprint(definition.title, definition.input, nextNodes, definition.edges));
+    setResult(emptyOutputBundle());
+    setRunLogs([{ id: 'hint', title: view === 'runner' ? '工作流已就绪' : '已进入编辑模式', detail: view === 'runner' ? '填写输入后即可运行，流程结构保持只读' : '修改完成后请保存回工作流库', status: 'muted' }]);
+    setActiveDebug('process');
+    setAssistantOpen(false);
+    setWorkspaceReturnView('library');
+    setWorkspaceView(view);
+    if (view === 'editor') {
+      setUndoStack([]);
+      setConfigPanelOpen(true);
+      setToast(`正在编辑「${workflow.title}」`);
+    }
+  };
+
+  const navigateToWorkspaceSection = (view: Exclude<WorkspaceView, 'editor' | 'runner'>) => {
+    if (workspaceView === 'editor' || workspaceView === 'runner' || workspaceView === 'library') setWorkspaceReturnView(workspaceView);
+    setWorkflowSaveOpen(false);
+    setAssistantOpen(false);
+    setWorkspaceView(view);
+    return true;
+  };
+
+  const returnToLibrary = () => {
+    const hasUnsavedEditorBehindView = workspaceView === 'editor' || workspaceReturnView === 'editor';
+    if (hasUnsavedEditorBehindView && editorDirty && !window.confirm('当前编排还有未保存到工作流库的更改。确定放弃这些更改并返回工作流库吗？')) return;
+    setWorkspaceReturnView('library');
+    setWorkflowSaveOpen(false);
+    setAssistantOpen(false);
+    setWorkspaceView('library');
+    setToast('已返回工作流库');
+  };
+
+  const returnFromWorkspaceSection = () => {
+    if (workspaceView === 'editor' || workspaceView === 'runner' || workspaceReturnView === 'library') {
+      returnToLibrary();
+      return;
+    }
+    setWorkspaceView(workspaceReturnView);
+    setToast(workspaceReturnView === 'editor' ? '已返回工作流编排' : '已返回只读使用页');
+  };
+
+  const deleteLibraryWorkflow = (workflow: SavedWorkflow) => {
+    if (!window.confirm(`确定删除“${workflow.title}”吗？此操作不会删除运行记录。`)) return;
+    setSavedWorkflows((items) => items.filter((item) => item.id !== workflow.id));
+    if (activeLibraryWorkflowId === workflow.id) {
+      setActiveLibraryWorkflowId(null);
+      if (workspaceView === 'runner') setWorkspaceView('library');
+    }
+    setToast(`已从工作流库删除「${workflow.title}」`);
+  };
+
+  const saveCurrentWorkflowToLibrary = (title: string, description: string) => {
+    const validation = validateWorkflowGraph({ nodes, edges });
+    if (!validation.valid) {
+      setToast(`保存失败：${validation.issues[0]?.message || '工作流结构无效'}`);
+      return false;
+    }
+    const snapshot = cleanSnapshot(nodes, edges);
+    const existing = activeLibraryWorkflowId ? savedWorkflows.find((workflow) => workflow.id === activeLibraryWorkflowId) : undefined;
+    const now = new Date().toISOString();
+    const saved = createWorkflowLibraryItem<Node<FlowData>, Edge>({
+      id: existing?.id,
+      title,
+      description,
+      input,
+      ...snapshot,
+      createdAt: existing?.createdAt,
+      updatedAt: now,
+      runCount: existing?.runCount,
+      lastRunAt: existing?.lastRunAt
+    }, now);
+    setSavedWorkflows((items) => upsertWorkflowLibraryItem(items, saved));
+    setActiveLibraryWorkflowId(saved.id);
+    setWorkflowTitle(saved.title);
+    setEditorBaseline(workflowDraftFingerprint(saved.title, input, snapshot.nodes, snapshot.edges));
+    setToast(existing ? `已更新「${saved.title}」` : `已保存「${saved.title}」`);
+    return true;
+  };
+
   const applyPreset = (preset: WorkflowPreset) => {
     if (nodes.length && !window.confirm(`使用“${preset.name}”将替换当前画布，是否继续？替换后仍可点击撤销恢复结构。`)) return;
     rememberSnapshot();
@@ -898,6 +1146,7 @@ function App() {
     setEdges(instance.edges as Edge[]);
     setWorkflowTitle(instance.name);
     setInput(instance.sampleInput);
+    setActiveLibraryWorkflowId(null);
     setSelectedId(instance.nodes.find((node) => node.data.kind !== 'start')?.id || instance.nodes[0]?.id || '');
     setResult(emptyOutputBundle());
     setRunLogs([{ id: 'hint', title: '模板已就绪', detail: `已载入 ${instance.nodes.length} 个节点，可直接试运行`, status: 'muted' }]);
@@ -937,8 +1186,9 @@ function App() {
   };
 
   const completeSuggestedWorkflow = () => {
+    if (!assistantAvailable) return;
     if (!providersForCapability(providers, 'chat').some((provider) => provider.apiKey)) {
-      setWorkspaceView('models');
+      navigateToWorkspaceSection('models');
       setToast('请先配置可用的文本模型，再启动 AI 构建 Session');
       return;
     }
@@ -965,6 +1215,7 @@ function App() {
     setNodes(syncNodeProviders(cleanNodes, providers));
     setEdges(draftEdges.map((edge) => ({ ...edge, animated: false })));
     setWorkflowTitle(draft.title);
+    setActiveLibraryWorkflowId(null);
     setSelectedId(cleanNodes[0]?.id || '');
     setToast(`AI 草案已应用：${cleanNodes.length} 个节点`);
     return null;
@@ -984,6 +1235,7 @@ function App() {
     setVersions(next);
     localStorage.setItem('aiflow.demo.versions', JSON.stringify(next));
     setToast(`${version.id} 已发布`);
+    setWorkspaceReturnView('editor');
     setWorkspaceView('versions');
   };
 
@@ -991,6 +1243,9 @@ function App() {
     rememberSnapshot();
     setNodes(version.nodes);
     setEdges(version.edges);
+    setActiveLibraryWorkflowId(null);
+    setEditorBaseline('__restored_version__');
+    setWorkspaceReturnView('library');
     setWorkspaceView('editor');
     setToast(`${version.id} 已恢复到画布`);
   };
@@ -1007,6 +1262,7 @@ function App() {
 
   const runWorkflow = async () => {
     if (running || !input.trim()) return;
+    const libraryRunId = workspaceView === 'runner' ? activeLibraryWorkflowId : null;
     const validation = validateWorkflowGraph({ nodes, edges });
     if (!validation.valid) {
       setToast(`运行失败：${validation.issues[0]?.message || '工作流结构无效'}`);
@@ -1025,7 +1281,7 @@ function App() {
     });
     if (modelConfigurationIssues.length) {
       setToast(`运行前请完成模型服务配置：${modelConfigurationIssues[0]}`);
-      setWorkspaceView('models');
+      navigateToWorkspaceSection('models');
       return;
     }
     const startNode = nodes.find((node) => node.data.kind === 'start')!;
@@ -1036,7 +1292,7 @@ function App() {
     setRunning(true);
     setResult(emptyOutputBundle());
     setDebugMode('docked');
-    setWorkspaceView('editor');
+    if (workspaceView !== 'runner') setWorkspaceView('editor');
     setActiveDebug('process');
     setNodes((items) => items.map((node) => ({ ...node, data: { ...node.data, status: reachableSet.has(node.id) ? 'waiting' : 'idle' } })));
     const started = performance.now();
@@ -1304,6 +1560,7 @@ function App() {
       setActiveDebug('logs');
     } finally {
       saveRecord();
+      if (libraryRunId) setSavedWorkflows((items) => markWorkflowLibraryRun(items, libraryRunId));
       abortControllerRef.current = null;
       setRunning(false);
     }
@@ -1357,35 +1614,67 @@ function App() {
     </div>
   </>;
 
+  if (workspaceView === 'library') {
+    return <div className="workflow-library-shell">
+      <header className="workflow-library-header">
+        <BrandMark />
+        <div className="workflow-library-context"><Library size={15} /><span><strong>工作流库</strong><small>{savedWorkflows.length} 个已保存工作流</small></span></div>
+      </header>
+      <WorkflowLibrary
+        workflows={savedWorkflows}
+        onCreate={startNewWorkflow}
+        onUse={(workflow) => openLibraryWorkflow(workflow, 'runner')}
+        onEdit={(workflow) => openLibraryWorkflow(workflow, 'editor')}
+        onDelete={deleteLibraryWorkflow}
+      />
+      {toast && <div className="toast" role="status">{toast}</div>}
+    </div>;
+  }
+
   return (
     <div className="app-shell">
       <header className="editor-header">
         <div className="header-left">
-          <button className="icon-button" aria-label="返回编排" onClick={() => { setWorkspaceView('editor'); setToast('已返回工作流编排'); }}><ArrowLeft size={18} /></button>
+          <button className="icon-button workspace-home-button" aria-label="返回工作流库" title="返回工作流库" onClick={returnToLibrary}><House size={18} /></button>
           <BrandMark />
           <span className="header-divider" />
           <div className="workflow-title">
-            <strong>{workflowTitle}</strong>
-            <span><Check size={12} /> 已保存</span>
+            <strong>{workspaceHeading}</strong>
+            <span>
+              {workspaceView === 'runner' ? <LockKeyhole size={12} />
+                  : workspaceView === 'editor' ? (editorDirty ? <Save size={12} /> : <Check size={12} />)
+                    : workspaceView === 'models' ? <Settings size={12} />
+                      : workspaceView === 'skills' ? <Sparkles size={12} />
+                        : workspaceView === 'runs' ? <TerminalSquare size={12} />
+                          : <Rocket size={12} />}
+              {workspaceDetail}
+            </span>
           </div>
         </div>
         <nav className="header-center" aria-label="工作流导航">
-          <button className={workspaceView === 'editor' ? 'active' : ''} onClick={() => setWorkspaceView('editor')}>编排</button>
-          <button className={workspaceView === 'models' ? 'active' : ''} onClick={() => setWorkspaceView('models')}>模型服务</button>
-          <button className={workspaceView === 'skills' ? 'active' : ''} onClick={() => setWorkspaceView('skills')}>Skills</button>
-          <button className={workspaceView === 'runs' ? 'active' : ''} onClick={() => setWorkspaceView('runs')}>运行记录</button>
-          <button className={workspaceView === 'versions' ? 'active' : ''} onClick={() => setWorkspaceView('versions')}>版本</button>
+          {workflowWorkspaceNavigationVisible ? <>
+            <button className={workspaceView === 'editor' ? 'active' : ''} onClick={() => { if (workspaceView !== 'editor') returnFromWorkspaceSection(); }}>编排</button>
+            <button className={workspaceView === 'models' ? 'active' : ''} onClick={() => navigateToWorkspaceSection('models')}>模型服务</button>
+            <button className={workspaceView === 'skills' ? 'active' : ''} onClick={() => navigateToWorkspaceSection('skills')}>Skills</button>
+            <button className={workspaceView === 'runs' ? 'active' : ''} onClick={() => navigateToWorkspaceSection('runs')}>运行记录</button>
+            <button className={workspaceView === 'versions' ? 'active' : ''} onClick={() => navigateToWorkspaceSection('versions')}>版本</button>
+          </> : <span className="runner-context-label"><LockKeyhole size={13} />只读运行</span>}
         </nav>
         <div className="header-actions">
-          <button className="icon-button header-tool" aria-label="撤销上一步" data-tooltip="撤销上一步" title="撤销上一步" onClick={undo} disabled={!undoStack.length || running}><Undo2 size={17} /></button>
-          <button className="icon-button header-tool" aria-label="复制工作流 JSON" data-tooltip="复制工作流 JSON" title="复制工作流 JSON" onClick={() => void copyWorkflow()}><ClipboardCopy size={17} /></button>
-          <button className="icon-button header-tool" aria-label="下载工作流文件" data-tooltip="下载工作流文件" title="下载工作流文件" onClick={exportWorkflow}><FileDown size={17} /></button>
-          <button className="icon-button header-tool" aria-label="导入工作流文件" data-tooltip="导入工作流文件" title="导入工作流文件" onClick={() => importWorkflowRef.current?.click()}><FileUp size={17} /></button>
-          <input ref={importWorkflowRef} className="visually-hidden" type="file" accept="application/json,.json,.aiflow.json" onChange={(event) => { importWorkflow(event.target.files?.[0]); event.target.value = ''; }} />
-          <button className="assistant-launch-button" onClick={() => { setWorkspaceView('editor'); completeSuggestedWorkflow(); }}><Bot size={15} />AI 构建</button>
-          <button className="ghost-button" onClick={() => setWorkspaceView('models')}><Settings size={16} /> 模型服务</button>
-          {running ? <button className="stop-button" onClick={stopWorkflow}><Square size={14} fill="currentColor" /> 停止运行</button> : <button className="run-button" onClick={runWorkflow}><Play size={16} fill="currentColor" />试运行</button>}
-          <button className="publish-button" onClick={publishWorkflow} disabled={running}><Rocket size={16} /> 发布</button>
+          {workspaceView === 'runner'
+            ? <><button className="ghost-button" onClick={returnToLibrary}><Library size={15} />工作流库</button>{activeLibraryWorkflow && <button className="publish-button" onClick={() => openLibraryWorkflow(activeLibraryWorkflow, 'editor')}><PencilLine size={15} />编辑工作流</button>}</>
+            : workspaceView === 'editor' ? <>
+                <button className="icon-button header-tool" aria-label="撤销上一步" data-tooltip="撤销上一步" title="撤销上一步" onClick={undo} disabled={!undoStack.length || running}><Undo2 size={17} /></button>
+                <button className="icon-button header-tool" aria-label="复制工作流 JSON" data-tooltip="复制工作流 JSON" title="复制工作流 JSON" onClick={() => void copyWorkflow()}><ClipboardCopy size={17} /></button>
+                <button className="icon-button header-tool" aria-label="下载工作流文件" data-tooltip="下载工作流文件" title="下载工作流文件" onClick={exportWorkflow}><FileDown size={17} /></button>
+                <button className="icon-button header-tool" aria-label="导入工作流文件" data-tooltip="导入工作流文件" title="导入工作流文件" onClick={() => importWorkflowRef.current?.click()}><FileUp size={17} /></button>
+                <input ref={importWorkflowRef} className="visually-hidden" type="file" accept="application/json,.json,.aiflow.json" onChange={(event) => { importWorkflow(event.target.files?.[0]); event.target.value = ''; }} />
+                {assistantAvailable && <button className="assistant-launch-button" onClick={completeSuggestedWorkflow}><Bot size={15} />AI 构建</button>}
+                <button className="ghost-button" onClick={() => navigateToWorkspaceSection('models')}><Settings size={16} /> 模型服务</button>
+                {running ? <button className="stop-button" onClick={stopWorkflow}><Square size={14} fill="currentColor" /> 停止运行</button> : <button className="run-button" onClick={runWorkflow}><Play size={16} fill="currentColor" />试运行</button>}
+                <button className="ghost-button workflow-save-trigger" onClick={() => setWorkflowSaveOpen(true)} disabled={running || (!editorDirty && !!activeLibraryWorkflow)}><Save size={15} />{activeLibraryWorkflow ? '保存更改' : '保存到库'}</button>
+                <button className="publish-button" onClick={publishWorkflow} disabled={running}><Rocket size={16} /> 发布</button>
+              </> : null}
         </div>
       </header>
 
@@ -1460,8 +1749,29 @@ function App() {
             <MiniMap nodeColor={(node) => nodeMeta[(node.data as FlowData).kind].color} maskColor="rgba(8,9,11,.82)" />
             <Controls showInteractive={false} />
           </ReactFlow>
-          <div className="canvas-status"><span className="live-dot" /> 自动保存已开启 <b>·</b> 节点可从左侧拖入</div>
-          </> : workspaceView === 'models' ? <ProviderManager providers={providers} onSave={saveProvider} onDelete={deleteProvider} /> : workspaceView === 'skills' ? <SkillManager serverSkills={skillCatalog} localSkills={localSkills} catalogStatus={skillCatalogStatus} onSave={saveLocalSkill} onDelete={deleteLocalSkill} /> : workspaceView === 'runs' ? <div className="workspace-data-view">
+          <div className="canvas-status"><span className="live-dot" /> 本地草稿自动保存 <b>·</b> 完成后请保存到工作流库</div>
+          </> : workspaceView === 'runner' && activeLibraryWorkflow ? <section className="workflow-use-page">
+            <header className="workflow-use-hero">
+              <div className="workflow-use-title"><span><LockKeyhole size={16} /></span><div><small>READ-ONLY WORKFLOW</small><h1>{activeLibraryWorkflow.title}</h1><p>{activeLibraryWorkflow.description}</p></div></div>
+              <div className="workflow-use-meta"><span><Check size={13} />已调试</span><span>{activeLibraryWorkflow.nodes.length} 个节点</span><span>{activeLibraryWorkflow.runCount} 次使用</span></div>
+            </header>
+            <div className="workflow-use-layout">
+              <aside className="workflow-use-route">
+                <div className="workflow-use-lock"><LockKeyhole size={16} /><div><strong>流程内容已锁定</strong><small>本页只允许填写输入并运行，不会修改节点与连接。</small></div></div>
+                <h2>执行路径</h2>
+                <div className="workflow-use-nodes">{activeLibraryWorkflow.nodes.slice(0, 8).map((node, index) => {
+                  const meta = nodeMeta[node.data.kind];
+                  const Icon = meta.icon;
+                  return <div key={node.id}><span style={{ color: meta.color }}><Icon size={15} /></span><div><strong>{node.data.title}</strong><small>{meta.label}</small></div>{index < Math.min(activeLibraryWorkflow.nodes.length, 8) - 1 && <i />}</div>;
+                })}</div>
+                <button onClick={() => openLibraryWorkflow(activeLibraryWorkflow, 'editor')}><PencilLine size={14} />需要调整？进入编辑工作流</button>
+              </aside>
+              <section className="workflow-use-console">
+                <div className="workflow-use-console-head"><div><span className="live-dot" /><strong>运行控制台</strong></div><small>定义版本不会因本次使用发生变化</small></div>
+                <section className="debug-window runner-debug">{debugPanelContent}</section>
+              </section>
+            </div>
+          </section> : workspaceView === 'runner' ? <div className="workflow-library-empty"><strong>工作流已不存在</strong><p>返回工作流库选择其他流程。</p><button onClick={() => setWorkspaceView('library')}>返回工作流库</button></div> : workspaceView === 'models' ? <ProviderManager providers={providers} onSave={saveProvider} onDelete={deleteProvider} /> : workspaceView === 'skills' ? <SkillManager serverSkills={skillCatalog} localSkills={localSkills} catalogStatus={skillCatalogStatus} onSave={saveLocalSkill} onDelete={deleteLocalSkill} /> : workspaceView === 'runs' ? <div className="workspace-data-view">
             <header><div><strong>运行记录</strong><small>最近 {runRecords.length} 次工作流执行</small></div></header>
             {runRecords.length ? <div className="record-list">{runRecords.map((record) => <article key={record.id}><span className={`record-state ${record.status}`} /> <div><strong>{record.status === 'success' ? '运行成功' : record.status === 'partial' ? '部分成功' : record.status === 'cancelled' ? '用户停止' : '运行失败'}</strong><small>{new Date(record.startedAt).toLocaleString()} · {record.logs.length} 个节点</small></div><code>{record.duration}</code><button onClick={() => { setRunLogs(record.logs); setResult(record.result); setWorkspaceView('editor'); setDebugMode('docked'); setActiveDebug(record.status === 'success' || record.status === 'partial' ? 'output' : 'logs'); }}>查看详情</button></article>)}</div> : <div className="data-empty"><TerminalSquare size={24} /><strong>暂无运行记录</strong><span>试运行工作流后会自动保存在这里</span></div>}
           </div> : <div className="workspace-data-view">
@@ -1521,7 +1831,7 @@ function App() {
                   <option value="max">最高 · 质量优先</option>
                 </select>
               </label>}
-              <button className="variable-button" onClick={() => setWorkspaceView('models')}><Settings size={14} />管理供应商与模型</button>
+              <button className="variable-button" onClick={() => navigateToWorkspaceSection('models')}><Settings size={14} />管理供应商与模型</button>
             </div>}
             {selectedNode.data.kind === 'llm' && <div className="form-section skill-section">
               <div className="skill-section-head">
@@ -1560,7 +1870,7 @@ function App() {
                 </button>)}
               </div>
               <div className="skill-note"><ImageIcon size={14} /><span><strong>GPT Image 2 Skill</strong>以 Advisor 模式生成图像提示词；请连接下游图像生成节点完成出图。</span></div>
-              <button className="variable-button skill-manage-button" onClick={() => setWorkspaceView('skills')}><Settings size={14} />管理本地 Skill</button>
+              <button className="variable-button skill-manage-button" onClick={() => navigateToWorkspaceSection('skills')}><Settings size={14} />管理本地 Skill</button>
             </div>}
             {selectedNode.data.kind === 'llm' && <div className="form-section">
               <h3>提示词</h3>
@@ -1632,7 +1942,7 @@ function App() {
         {workspaceView === 'editor' && debugMode === 'minimized' && <button className="debug-minimized-pill" onClick={restoreDebug} title="还原调试台"><TerminalSquare size={15} /><span>调试台</span><ChevronsUp size={14} /></button>}
       </main>
 
-      <WorkflowAssistant
+      {assistantAvailable && <WorkflowAssistant
         open={assistantOpen}
         providers={providers}
         session={assistantSession}
@@ -1641,8 +1951,16 @@ function App() {
         onSessionChange={setAssistantSession}
         onApply={applyAssistantDraft}
         onClose={() => setAssistantOpen(false)}
-        onOpenModels={() => { setAssistantOpen(false); setWorkspaceView('models'); }}
-      />
+        onOpenModels={() => { setAssistantOpen(false); navigateToWorkspaceSection('models'); }}
+      />}
+
+      {workflowSaveOpen && <WorkflowSaveDialog
+        title={workflowTitle}
+        description={activeLibraryWorkflow?.description || ''}
+        isUpdate={!!activeLibraryWorkflow}
+        onClose={() => setWorkflowSaveOpen(false)}
+        onSave={saveCurrentWorkflowToLibrary}
+      />}
 
       {toast && <div className="toast" role="status">{toast}</div>}
 

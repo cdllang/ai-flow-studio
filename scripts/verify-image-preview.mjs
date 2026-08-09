@@ -59,6 +59,7 @@ async function verifyRatio({ name, ratioLabel, width, height, screenshot }) {
   }));
 
   await page.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
   await page.locator('.flow-node').filter({ hasText: '\u751f\u6210\u4e3b\u89c6\u89c9' }).click();
   await page.getByRole('button', { name: new RegExp(`^${ratioLabel}`) }).click();
   await page.getByRole('button', { name: '\u8bd5\u8fd0\u884c' }).click();

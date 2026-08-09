@@ -25,6 +25,7 @@ await page.addInitScript(() => localStorage.setItem('aiflow.demo.apiKeys', JSON.
 attachDiagnostics(page);
 await mockConfigured(page);
 await page.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
+await page.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
 
 const tooltipDescriptions = await page.locator('.header-actions .header-tool').evaluateAll((buttons) => buttons.map((button) => button.getAttribute('data-tooltip')));
 const headerTooltips = JSON.stringify(tooltipDescriptions) === JSON.stringify(['撤销上一步', '复制工作流 JSON', '下载工作流文件', '导入工作流文件']);
@@ -87,6 +88,7 @@ const branchPage = await branchContext.newPage();
 attachDiagnostics(branchPage);
 await mockConfigured(branchPage);
 await branchPage.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
+await branchPage.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
 await branchPage.getByRole('button', { name: '试运行' }).click();
 try {
   await branchPage.getByText('TRUE_PATH').waitFor({ timeout: 8000 });
@@ -121,6 +123,7 @@ await stopPage.route('**/api/chat', async (route) => {
   await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ text: 'late response' }) });
 });
 await stopPage.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
+await stopPage.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
 await stopPage.getByRole('button', { name: '试运行' }).click();
 await stopPage.locator('.stop-button').waitFor();
 await stopPage.locator('.stop-button').click();
@@ -143,6 +146,7 @@ attachDiagnostics(httpPage);
 await mockConfigured(httpPage);
 await httpPage.route('**/api/http', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 200, body: { message: 'HTTP_NODE_OK' } }) }));
 await httpPage.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
+await httpPage.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
 await httpPage.getByRole('button', { name: '试运行' }).click();
 await httpPage.getByText(/HTTP_NODE_OK/).waitFor();
 const httpNodeExecuted = await httpPage.getByText(/HTTP_NODE_OK/).isVisible();

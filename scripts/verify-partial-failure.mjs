@@ -43,6 +43,7 @@ await page.route('**/api/config/status', (route) => route.fulfill({
 }));
 
 await page.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
+await page.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
 await page.getByRole('button', { name: '试运行' }).click();
 await page.getByRole('button', { name: '试运行' }).waitFor({ timeout: 10_000 });
 await page.getByRole('button', { name: '日志' }).click();

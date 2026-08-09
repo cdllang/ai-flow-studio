@@ -13,6 +13,7 @@ import {
   inputOutputSignature,
   normalizeAssistantEnvelope,
   normalizeTaskContract,
+  normalizeWorkflowRepairResponse,
   shouldCompressSession,
   taskContractReady,
   validateWorkflowDraft,
@@ -98,6 +99,13 @@ test('assistant envelope accepts clarification or draft and rejects ambiguous mo
   assert.throws(() => normalizeAssistantEnvelope({ status: 'needs_clarification', message: 'missing questions', contract, questions: [] }), /questions/);
 });
 
+test('workflow repair response accepts a corrected draft without trusting AssistantTurn status', () => {
+  const repaired = normalizeWorkflowRepairResponse({ status: 'success', message: '修复完成', draft: validDraft() });
+  assert.equal(repaired.message, '修复完成');
+  assert.equal(repaired.draft.schema, 'aiflow.workflow-draft');
+  assert.throws(() => normalizeWorkflowRepairResponse({ status: 'success', message: '没有草案' }), /workflow draft/);
+});
+
 test('JSON extraction tolerates prose and identical duplicates but rejects conflicting objects', () => {
   const payload = { status: 'ok', nested: { text: 'brace } inside a string' }, escaped: '"quoted"' };
   assert.deepEqual(extractJsonObject(`Result:\n${JSON.stringify(payload)}\nDone.`), payload);
@@ -181,6 +189,18 @@ test('deterministic validator rejects stale graph shapes that could silently dro
   assert.equal(codes.has('OUTPUT_HAS_OUTGOING'), true);
 });
 
+test('condition validation reports the exact runtime operator enum for model repair', () => {
+  const draft = validDraft();
+  draft.plan.steps[1] = { ...draft.plan.steps[1], kind: 'condition', title: '判断渠道' };
+  draft.nodes[1].data = { kind: 'condition', title: '判断渠道', subtitle: '按渠道分流', status: 'idle', conditionOperator: 'includes', conditionValue: '短视频' };
+  draft.plan.connections[1].sourceHandle = 'true';
+  draft.plan.connections.push({ id: 'edge-condition-false', source: 'llm-1', target: 'output-1', sourceHandle: 'false', reason: '交付其他渠道结果', dataType: 'text' });
+  const result = validateWorkflowDraft(compileWorkflowDraft(draft), { providers, constraints: contract.constraints });
+  const invalidOperator = result.issues.find((entry) => entry.code === 'CONDITION_OPERATOR_INVALID');
+  assert.match(invalidOperator?.message || '', /contains.*not_contains.*equals.*not_equals/);
+  assert.match(invalidOperator?.suggestedFix || '', /conditionOperator/);
+});
+
 test('WorkflowPlan is the sole graph source and compiler ignores model-authored positions and edges', () => {
   const draft = validDraft();
   draft.nodes[0].position = { x: 9999, y: 9999 };
@@ -205,10 +225,54 @@ test('deterministic validator rejects duplicate, redundant and ambiguous plan co
   assert.equal(codes.has('MULTIPLE_PRIMARY_INPUTS'), true);
 });
 
+test('deterministic validator preserves explicit direct field dependencies across transitive graph paths', () => {
+  const draft = {
+    schema: 'aiflow.workflow-draft',
+    schemaVersion: 1,
+    title: '封面创意生成器',
+    plan: {
+      schema: 'aiflow.workflow-plan',
+      schemaVersion: 1,
+      summary: '分析参考截图，生成封面图片，并汇总文本与图像结果。',
+      steps: [
+        { id: 'start', kind: 'start', title: '开始', purpose: '接收创意描述和参考截图', inputs: [], outputs: ['创意描述', '参考截图'] },
+        { id: 'analyze', kind: 'llm', title: '分析创意', purpose: '分析创意并生成标题与提示词', inputs: ['创意描述', '参考截图'], outputs: ['标题建议', '视觉分析', '出图提示词'] },
+        { id: 'image-context', kind: 'aggregate', title: '整理出图上下文', purpose: '组合原始参考截图与分析结果', inputs: ['参考截图', '视觉分析', '出图提示词'], outputs: ['出图上下文'] },
+        { id: 'image-01', kind: 'image', title: '生成封面', purpose: '根据上下文生成封面图片', inputs: ['出图上下文'], outputs: ['封面图片'] },
+        { id: 'result-aggregate', kind: 'aggregate', title: '汇总结果', purpose: '汇总标题、分析和封面图片', inputs: ['标题建议', '视觉分析', '封面图片'], outputs: ['汇总结果'] },
+        { id: 'output', kind: 'output', title: '输出', purpose: '交付汇总结果', inputs: ['汇总结果'], outputs: [] }
+      ],
+      connections: [
+        { id: 'start-to-analyze', source: 'start', target: 'analyze', reason: '传递创意描述和参考截图用于分析', dataType: 'mixed' },
+        { id: 'start-to-image-context', source: 'start', target: 'image-context', reason: '直接传递未处理的参考截图', dataType: 'image' },
+        { id: 'analyze-to-image-context', source: 'analyze', target: 'image-context', reason: '传递视觉分析和出图提示词', dataType: 'mixed' },
+        { id: 'analyze-to-result-aggregate', source: 'analyze', target: 'result-aggregate', reason: '直接保留标题和视觉分析文本', dataType: 'text' },
+        { id: 'image-context-to-image-01', source: 'image-context', target: 'image-01', reason: '传递出图上下文', dataType: 'mixed' },
+        { id: 'image-01-to-result-aggregate', source: 'image-01', target: 'result-aggregate', reason: '传递封面图片', dataType: 'image' },
+        { id: 'result-aggregate-to-output', source: 'result-aggregate', target: 'output', reason: '交付汇总结果', dataType: 'mixed' }
+      ]
+    },
+    nodes: [
+      { id: 'start', type: 'flowNode', data: { kind: 'start', title: '开始', subtitle: '创意描述和参考截图', status: 'idle' } },
+      { id: 'analyze', type: 'flowNode', data: { kind: 'llm', title: '分析创意', subtitle: 'text-model', status: 'idle', providerId: 'provider-main', model: 'text-model', prompt: '分析创意并生成标题与提示词', inputMapping: { 创意描述: 'start.创意描述', 参考截图: 'start.参考截图' } } },
+      { id: 'image-context', type: 'flowNode', data: { kind: 'aggregate', title: '整理出图上下文', subtitle: '组合原图和分析结果', status: 'idle', inputMapping: { 参考截图: 'start.参考截图', 视觉分析: 'analyze.视觉分析', 出图提示词: 'analyze.出图提示词' } } },
+      { id: 'image-01', type: 'flowNode', data: { kind: 'image', title: '生成封面', subtitle: 'image-model', status: 'idle', providerId: 'provider-main', model: 'image-model', imageCount: 1, inputMapping: { 出图上下文: 'image-context.出图上下文' } } },
+      { id: 'result-aggregate', type: 'flowNode', data: { kind: 'aggregate', title: '汇总结果', subtitle: '汇总文本和图片', status: 'idle', inputMapping: { 标题建议: 'analyze.标题建议', 视觉分析: 'analyze.视觉分析', 封面图片: 'image-01.封面图片' } } },
+      { id: 'output', type: 'flowNode', data: { kind: 'output', title: '输出', subtitle: '交付汇总结果', status: 'idle' } }
+    ]
+  };
+  const result = validateWorkflowDraft(compileWorkflowDraft(draft), { providers, constraints: contract.constraints });
+  assert.equal(result.valid, true);
+  assert.deepEqual(result.issues.filter((entry) => entry.code === 'REDUNDANT_TRANSITIVE_EDGE'), []);
+});
+
 test('system workflow Skill is loaded from the private system-skills tree', () => {
   const skill = loadWorkflowAssistantSkill(path.resolve('system-skills'));
   assert.equal(skill.id, 'guard-workflow-intent');
   assert.match(skill.builder, /strict task contract/i);
   assert.match(skill.critic, /isolated model call/i);
+  assert.match(skill.contracts, /Topological reachability alone is not redundancy/i);
+  assert.match(skill.contracts, /conditionOperator: 'contains' \| 'not_contains' \| 'equals' \| 'not_equals'/);
+  assert.match(skill.critic, /inputMapping/);
   assert.match(skill.memory, /70%/);
 });

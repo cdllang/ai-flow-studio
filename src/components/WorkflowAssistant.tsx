@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, ArrowRight, Bot, Check, ChevronDown, CircleStop, GitBranch, ListTree, LoaderCircle, Plus, RotateCcw, Send, ShieldCheck, Sparkles, X } from 'lucide-react';
+import { AlertTriangle, ArrowRight, Bot, Bug, Check, ChevronDown, CircleStop, GitBranch, ListTree, LoaderCircle, Plus, RotateCcw, Send, Settings2, ShieldCheck, Sparkles, X } from 'lucide-react';
 import { assistantProviderCatalog, createWorkflowAssistantSession, type AssistantStage, type WorkflowAssistantDraft, type WorkflowAssistantResponse, type WorkflowAssistantSession, type WorkflowPlan } from '../assistantSession';
+import { assistantSessionLogFilename, buildAssistantSessionLog } from '../assistantSessionLog';
 import { AssistantTransportError, readAssistantTurnResponse } from '../assistantTransport';
 import { providersForCapability, type ModelProvider } from '../providerConfig';
 
@@ -106,7 +107,7 @@ function WorkflowPlanPreview({ draft, applied, disabled, onApply, onRevise }: { 
         })}
       </div>
     </div>
-    <details className="assistant-plan-explanation" open>
+    <details className="assistant-plan-explanation">
       <summary><span><ListTree size={13} />流程说明</span><small>全部内容均从同一流程定义生成</small></summary>
       <div className="assistant-plan-steps">
         {plan.steps.map((step, index) => <article key={step.id}>
@@ -137,6 +138,7 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
   const [stages, setStages] = useState<AssistantStage[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [compressionNotice, setCompressionNotice] = useState('');
+  const [logExported, setLogExported] = useState(false);
   const [customAnswerOpen, setCustomAnswerOpen] = useState(false);
   const [customAnswer, setCustomAnswer] = useState('');
   const messagesRef = useRef<HTMLDivElement | null>(null);
@@ -147,6 +149,9 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
   const draftStale = Boolean(session.candidateDraft && session.phase !== 'applied' && session.currentWorkflowRevision && session.currentWorkflowRevision !== currentWorkflowRevision);
   const pendingQuestion = session.phase === 'discovery' ? session.contract.unresolvedQuestions[0] || '' : '';
   const activeStage = [...stages].reverse().find((stage) => stage.status === 'running');
+  const completedStageCount = stages.filter((stage) => stage.status === 'success').length;
+  const visibleTurns = session.recentTurns.slice(-6);
+  const earlierTurns = session.recentTurns.slice(0, -6);
 
   useEffect(() => {
     if (!builderKey && initialConnection) setBuilderKey(initialConnection.key);
@@ -274,37 +279,73 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
   const constraint = session.contract.constraints;
   const updateConstraint = (patch: Partial<typeof constraint>) => onSessionChange({ ...session, contract: { ...session.contract, constraints: { ...constraint, ...patch } }, updatedAt: new Date().toISOString() });
 
+  const exportSessionLog = () => {
+    const log = buildAssistantSessionLog({
+      session,
+      stages,
+      currentWorkflow,
+      currentWorkflowRevision,
+      runtime: {
+        sending,
+        elapsedSeconds,
+        error,
+        errorCode,
+        errorRequestId,
+        composerDraft: message,
+        pendingAttempt: retryAttempt,
+        builder: builder ? { providerId: builder.provider.id, providerName: builder.provider.name, modelId: builder.model.id } : null,
+        critic: critic ? { providerId: critic.provider.id, providerName: critic.provider.name, modelId: critic.model.id } : null
+      }
+    });
+    const url = URL.createObjectURL(new Blob([log], { type: 'text/plain;charset=utf-8' }));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = assistantSessionLogFilename(session.id);
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+    setLogExported(true);
+    window.setTimeout(() => setLogExported(false), 2_000);
+  };
+
   return <aside className="workflow-assistant" role="dialog" aria-modal="true" aria-label="AI 工作流构建 Session">
     <header className="assistant-head">
       <div><span className="assistant-head-icon"><Bot size={18} /></span><div><strong>AI 构建 Session</strong><small><span className={`assistant-phase phase-${session.phase}`} />{phaseLabel[session.phase]} · {session.id.slice(-8)}</small></div></div>
-      <div><button className="icon-button tiny" aria-label="新建 AI Session" onClick={resetSession}><Plus size={15} /></button><button className="icon-button tiny" aria-label="关闭 AI 工作流助手" onClick={onClose}><X size={16} /></button></div>
+      <div><button className="assistant-report-button" aria-label="报错并导出 Session 日志" title="导出脱敏的完整 Session 日志" onClick={exportSessionLog}><Bug size={13} />{logExported ? '已导出' : '报错'}</button><button className="icon-button tiny" aria-label="新建 AI Session" onClick={resetSession}><Plus size={15} /></button><button className="icon-button tiny" aria-label="关闭 AI 工作流助手" onClick={onClose}><X size={16} /></button></div>
     </header>
 
-    <section className="assistant-model-bar">
-      {connections.length ? <>
-        <label><span>Builder</span><div><select ref={builderSelectRef} aria-label="AI Builder 模型" value={builder?.key || ''} onChange={(event) => setBuilderKey(event.target.value)}>{connections.map((entry) => <option key={entry.key} value={entry.key}>{entry.provider.name} · {entry.model.id}</option>)}</select><ChevronDown size={13} /></div></label>
-        <label><span>Critic</span><div><select aria-label="AI Critic 模型" value={criticKey} onChange={(event) => setCriticKey(event.target.value)}><option value="same">同模型 · 隔离上下文</option>{connections.map((entry) => <option key={entry.key} value={entry.key}>{entry.provider.name} · {entry.model.id}</option>)}</select><ChevronDown size={13} /></div></label>
-      </> : <button className="assistant-empty-model" onClick={onOpenModels}>请先配置可用的文本模型</button>}
-    </section>
-
-    <div className="assistant-skill-lock"><ShieldCheck size={14} /><span><strong>guard-workflow-intent</strong>系统级自动调用 · 用户不可关闭</span></div>
+    <details className="assistant-settings">
+      <summary><span><Settings2 size={13} />构建配置</span><small>{builder ? `${builder.provider.name} · ${builder.model.id}` : '未配置模型'}</small><ChevronDown size={13} /></summary>
+      <section className="assistant-model-bar">
+        {connections.length ? <>
+          <label><span>Builder</span><div><select ref={builderSelectRef} aria-label="AI Builder 模型" value={builder?.key || ''} onChange={(event) => setBuilderKey(event.target.value)}>{connections.map((entry) => <option key={entry.key} value={entry.key}>{entry.provider.name} · {entry.model.id}</option>)}</select><ChevronDown size={13} /></div></label>
+          <label><span>Critic</span><div><select aria-label="AI Critic 模型" value={criticKey} onChange={(event) => setCriticKey(event.target.value)}><option value="same">同模型 · 隔离上下文</option>{connections.map((entry) => <option key={entry.key} value={entry.key}>{entry.provider.name} · {entry.model.id}</option>)}</select><ChevronDown size={13} /></div></label>
+        </> : <button className="assistant-empty-model" onClick={onOpenModels}>请先配置可用的文本模型</button>}
+      </section>
+      <div className="assistant-skill-lock"><ShieldCheck size={14} /><span><strong>guard-workflow-intent</strong>系统级自动调用 · 用户不可关闭</span></div>
+    </details>
 
     <div className="assistant-scroll" ref={messagesRef}>
       {!session.recentTurns.length && <div className="assistant-welcome"><Sparkles size={22} /><strong>描述你希望创建或调整的工作流</strong><p>我会识别任务并只请你确认输入与输出，其他实现边界按安全默认值自动处理。</p><div><button onClick={() => setMessage('根据当前工作流，为三个渠道分别生成商品图片和对应文案。')}>创建多渠道内容流</button><button onClick={() => setMessage('检查当前工作流并减少不必要的模型调用，同时保留全部输出。')}>优化当前工作流</button></div></div>}
-      {session.recentTurns.map((turn) => <article className={`assistant-message ${turn.role}`} key={turn.id}><span>{turn.role === 'user' ? '你' : <Bot size={13} />}</span><div><p>{turn.content}</p><time>{new Date(turn.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div></article>)}
-      {sending && <article className="assistant-message assistant loading"><span><LoaderCircle className="spin" size={13} /></span><div><p>{activeStage ? `${stageLabel[activeStage.stage] || activeStage.stage}：${activeStage.detail}` : '正在建立 AI 构建连接…'}</p><time>已用时 {formatElapsed(elapsedSeconds)} · 阶段结果实时返回</time></div></article>}
+      {earlierTurns.length > 0 && <details className="assistant-history"><summary>查看较早的 {earlierTurns.length} 条消息</summary><div>{earlierTurns.map((turn) => <article className={`assistant-message ${turn.role}`} key={turn.id}><span>{turn.role === 'user' ? '你' : <Bot size={13} />}</span><div><p>{turn.content}</p><time>{new Date(turn.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div></article>)}</div></details>}
+      {visibleTurns.map((turn) => <article className={`assistant-message ${turn.role}`} key={turn.id}><span>{turn.role === 'user' ? '你' : <Bot size={13} />}</span><div><p>{turn.content}</p><time>{new Date(turn.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div></article>)}
 
-      {(session.contract.objective || session.contract.unresolvedQuestions.length > 0) && <section className="assistant-contract">
-        <header><strong>任务摘要</strong><span>{session.contract.unresolvedQuestions.length ? '待确认输入输出' : '输入输出已确认'}</span></header>
-        {session.contract.objective && <p>{session.contract.objective}</p>}
-        <dl><div><dt>输入</dt><dd>{session.contract.inputs.length}</dd></div><div><dt>输出</dt><dd>{session.contract.outputs.length}</dd></div><div><dt>验收标准</dt><dd>{session.contract.acceptanceCriteria.length}</dd></div></dl>
-        <div className="assistant-permissions">
-          <label><input type="checkbox" checked={constraint.allowHttp} onChange={(event) => updateConstraint({ allowHttp: event.target.checked })} />允许 HTTP</label>
-          <label><input type="checkbox" checked={constraint.allowCode} onChange={(event) => updateConstraint({ allowCode: event.target.checked })} />允许代码</label>
-          <label>文本调用<input aria-label="最大文本模型调用" type="number" min="0" max="40" value={constraint.maxModelCalls} onChange={(event) => updateConstraint({ maxModelCalls: Math.max(0, Math.min(40, Number(event.target.value) || 0)) })} /></label>
-          <label>图片数<input aria-label="最大图片生成数" type="number" min="0" max="20" value={constraint.maxImageCalls} onChange={(event) => updateConstraint({ maxImageCalls: Math.max(0, Math.min(20, Number(event.target.value) || 0)) })} /></label>
-        </div>
+      {stages.length > 0 && <section className={`assistant-activity ${sending ? 'running' : stages.some((stage) => stage.status === 'error') ? 'error' : 'complete'}`} aria-live="polite">
+        <div className="assistant-activity-main"><span>{sending ? <LoaderCircle className="spin" size={14} /> : stages.some((stage) => stage.status === 'error') ? <X size={14} /> : <Check size={14} />}</span><div><strong>{sending ? stageLabel[activeStage?.stage || ''] || activeStage?.stage || '正在建立 AI 构建连接' : stages.some((stage) => stage.status === 'error') ? '本轮构建需要处理' : '本轮构建已完成'}</strong><small>{sending ? activeStage?.detail || '正在等待第一个阶段结果…' : `${completedStageCount}/${stages.length} 个阶段完成`}</small></div><time>{formatElapsed(elapsedSeconds)}</time></div>
+        <details className="assistant-activity-details"><summary>运行详情 <span>{completedStageCount}/{stages.length}</span></summary><div>{stages.map((stage, index) => <div key={`${stage.stage}-${index}`} className={stage.status}><span>{stage.status === 'running' ? <LoaderCircle className="spin" size={11} /> : stage.status === 'success' ? <Check size={11} /> : <X size={11} />}</span><div><strong>{stageLabel[stage.stage] || stage.stage}</strong><small>{stage.detail}</small></div></div>)}</div></details>
       </section>}
+
+      {(session.contract.objective || session.contract.unresolvedQuestions.length > 0) && <details className="assistant-contract">
+        <summary><span><strong>任务摘要</strong><small>{session.contract.objective || '等待识别任务目标'}</small></span><span>{session.contract.inputs.length} 输入 → {session.contract.outputs.length} 输出</span></summary>
+        <div className="assistant-contract-body"><header><strong>任务边界</strong><span>{session.contract.unresolvedQuestions.length ? '待确认输入输出' : '输入输出已确认'}</span></header>
+          <dl><div><dt>输入</dt><dd>{session.contract.inputs.length}</dd></div><div><dt>输出</dt><dd>{session.contract.outputs.length}</dd></div><div><dt>验收标准</dt><dd>{session.contract.acceptanceCriteria.length}</dd></div></dl>
+          <div className="assistant-permissions">
+            <label><input type="checkbox" checked={constraint.allowHttp} onChange={(event) => updateConstraint({ allowHttp: event.target.checked })} />允许 HTTP</label>
+            <label><input type="checkbox" checked={constraint.allowCode} onChange={(event) => updateConstraint({ allowCode: event.target.checked })} />允许代码</label>
+            <label>文本调用<input aria-label="最大文本模型调用" type="number" min="0" max="40" value={constraint.maxModelCalls} onChange={(event) => updateConstraint({ maxModelCalls: Math.max(0, Math.min(40, Number(event.target.value) || 0)) })} /></label>
+            <label>图片数<input aria-label="最大图片生成数" type="number" min="0" max="20" value={constraint.maxImageCalls} onChange={(event) => updateConstraint({ maxImageCalls: Math.max(0, Math.min(20, Number(event.target.value) || 0)) })} /></label>
+          </div>
+        </div>
+      </details>}
 
       {pendingQuestion && <section className="assistant-confirmation">
         <header><strong>确认输入与输出</strong><small>请选择一个回答</small></header>
@@ -318,17 +359,15 @@ export function WorkflowAssistant({ open, providers, session, currentWorkflow, c
       </section>}
 
       {compressionNotice && <div className="assistant-compression"><RotateCcw size={13} />{compressionNotice}</div>}
-      {stages.length > 0 && <section className="assistant-stages" aria-live="polite"><header><strong>构建进度</strong><small>{sending ? `实时执行 · ${formatElapsed(elapsedSeconds)}` : `完成 ${stages.filter((stage) => stage.status === 'success').length}/${stages.length} 个阶段`}</small></header>{stages.map((stage, index) => <div key={`${stage.stage}-${index}`} className={`${stage.status}${stage.status === 'running' ? ' current' : ''}`} aria-current={stage.status === 'running' ? 'step' : undefined}><span data-step={index + 1}>{stage.status === 'running' ? <LoaderCircle className="spin" size={12} /> : stage.status === 'success' ? <Check size={12} /> : <X size={12} />}</span><div><strong>{stageLabel[stage.stage] || stage.stage}</strong><small>{stage.detail}</small></div></div>)}</section>}
 
-      {!sending && session.validation && (!session.validation.valid || session.phase === 'awaiting_confirmation' || session.phase === 'applied') && <section className={`assistant-validation ${session.validation.valid ? 'valid' : 'invalid'}`}>
-        <header>{session.validation.valid ? <Check size={14} /> : <AlertTriangle size={14} />}<strong>{session.validation.valid ? '草案已通过严格校验' : '草案已阻断'}</strong><span>{session.validation.repairAttempt} 次修复</span></header>
-        {session.validation.issues.slice(0, 6).map((issue, index) => <div className={`assistant-issue ${issue.severity}`} key={`${issue.code}-${index}`}><code>{issue.code}</code><p>{issue.message}</p>{issue.evidence && <small>{issue.evidence}</small>}</div>)}
-      </section>}
+      {!sending && session.validation && (!session.validation.valid || session.phase === 'awaiting_confirmation' || session.phase === 'applied') && <details className={`assistant-validation ${session.validation.valid ? 'valid' : 'invalid'}`}>
+        <summary>{session.validation.valid ? <Check size={14} /> : <AlertTriangle size={14} />}<strong>{session.validation.valid ? '草案已通过严格校验' : '草案已阻断'}</strong><span>{session.validation.issues.length} 项 · {session.validation.repairAttempt} 次修复</span></summary>
+        <div>{session.validation.issues.slice(0, 6).map((issue, index) => <div className={`assistant-issue ${issue.severity}`} key={`${issue.code}-${index}`}><code>{issue.code}</code><p>{issue.message}</p>{issue.evidence && <small>{issue.evidence}</small>}</div>)}</div>
+      </details>}
 
-      {sending && session.candidateDraft?.plan && <section className="assistant-plan-refreshing" role="status"><span><LoaderCircle className="spin" size={16} /></span><div><strong>正在生成新版流程方案</strong><small>上一版已锁定，等待本轮校验链完成</small></div></section>}
       {!sending && session.candidateDraft?.plan && <WorkflowPlanPreview draft={session.candidateDraft} applied={session.phase === 'applied'} disabled={session.phase !== 'awaiting_confirmation' || !session.validation?.valid || draftStale} onApply={applyDraft} onRevise={() => { setMessage('请调整当前流程方案：'); requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('.assistant-composer textarea')?.focus()); }} />}
       {draftStale && <div className="assistant-error"><AlertTriangle size={14} />画布已更新，此草案不能覆盖最新修改。请继续对话以重新生成。</div>}
-      {error && <div className="assistant-error" role="alert"><div className="assistant-error-copy"><AlertTriangle size={14} /><span>{errorCode && <code>{errorCode}</code>}{error}{errorRequestId && <small>请求 ID：{errorRequestId}</small>}</span></div><div className="assistant-error-actions">{retryAttempt && <button onClick={() => void send(retryAttempt.message, retryAttempt.confirmation, true)}>重新尝试</button>}<button onClick={() => builderSelectRef.current?.focus()}>切换模型</button></div></div>}
+      {error && <div className="assistant-error" role="alert"><div className="assistant-error-copy"><AlertTriangle size={14} /><span>{errorCode && <code>{errorCode}</code>}{error}{errorRequestId && <small>请求 ID：{errorRequestId}</small>}</span></div><div className="assistant-error-actions"><button onClick={exportSessionLog}><Bug size={12} />{logExported ? '日志已导出' : '导出日志'}</button>{retryAttempt && <button onClick={() => void send(retryAttempt.message, retryAttempt.confirmation, true)}>重新尝试</button>}<button onClick={() => { document.querySelector<HTMLDetailsElement>('.assistant-settings')?.setAttribute('open', ''); requestAnimationFrame(() => builderSelectRef.current?.focus()); }}>切换模型</button></div></div>}
     </div>
 
     <footer className="assistant-composer">

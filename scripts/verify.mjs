@@ -14,6 +14,7 @@ page.on('console', (message) => {
 page.on('pageerror', (error) => pageErrors.push(error.message));
 
 await page.goto('http://127.0.0.1:14590', { waitUntil: 'networkidle' });
+await page.getByRole('button', { name: '编辑工作流', exact: true }).first().click();
 await page.locator('.run-button').click();
 const outcome = await Promise.race([
   page.locator('.result-view img').waitFor({ state: 'visible', timeout: 180_000 }).then(() => 'success'),
